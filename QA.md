@@ -1,7 +1,7 @@
 # QA — Bothost edition
 
 Выполнено локально:
-- 32 unittest: paths/symlinks, shell timeout/output/env, ZIP, settings permissions, actions protocol, owner/private-chat allowlist, no key echo, setup saving, Google URL allowlist, no raw PTY in status, auth input validation, token expiration, HTTPS URL validation — PASS.
+- 44 unittest: paths/symlinks, shell timeout/output/env, ZIP, settings permissions, actions protocol, owner/private-chat allowlist, no key echo, setup saving, Google URL allowlist, no raw PTY in status, auth input validation, token expiration, HTTPS URL validation — PASS.
 - Официальный Antigravity CLI установлен в тестовую папку; реальные --help/модели commands исследованы.
 - Login manager запустил реальный agy в PTY, выбрал Google OAuth, получил официальный accounts.google.com URL и достиг waiting_code — PASS. В Google не входили.
 - Отмена login/PTy процесса — PASS.
@@ -25,3 +25,11 @@
 ## Form rejection diagnostics
 
 9 новых тестов: canonical HTTPS origin, стандартный Forwarded header, отсутствие TLS без обхода, storage-проверка, различимые ошибки missing/invalid token, JSON capability fallback, отказ неверному Origin без передачи OAuth-кода, malformed JSON. PASS. Локальный Chromium открыл форму с mock responses, проверил JS и восстановление токена после reload: PASS. Реальный HTTPS reverse proxy Bothost пока не проверен.
+
+## Encrypted OAuth code / headerless reverse proxy
+
+44 unit tests PASS: дополнительно RSA/AES envelope, tampering, cross-session rejection, replay, long code, TLS proof failures/peer binding, encrypted HTTP code round-trip, отказ plaintext input, подтверждённый и неподтверждённый headerless proxy.
+
+Локальный integration smoke с Chromium и TLS reverse proxy, намеренно удаляющим ВСЕ forwarded scheme headers: PASS. Проверены публичный proof-круг к тому же backend, private TCP-peer pin, refresh формы, WebCrypto RSA/AES шифрование и дешифрование тестового кода. В теле POST на прокси plaintext кода отсутствовал. Самоподписанный сертификат отвергнут production default CA validation; тестовый успешный контур использовал явно доверенный тестовый CA только в QA harness. Код production не отключает SSL validation.
+
+Живой Bothost round-trip после этих изменений и завершение Google OAuth по-прежнему не проверены — необходимо обновление deployment пользователем.

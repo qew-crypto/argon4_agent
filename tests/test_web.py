@@ -80,3 +80,32 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         async with self.client.post(self.url+'/auth/status',data='invalid') as r:
             self.assertEqual(r.status,400)
             self.assertEqual((await r.json())['error'],'invalid_json')
+
+    async def test_plaintext_code_no_longer_accepted(self):
+        headers={'X-Forwarded-Proto':'https','Origin':'https://qa.example.test','Authorization':'Bearer test-capability'}
+        code,data=await self.post(headers,{'code':'LOCAL_TEST_CODE'},'/auth/code')
+        self.assertEqual((code,data['error']),(400,'encrypted_input_required'))
+        self.login.submit.assert_not_awaited()
+
+    async def test_encrypted_code_roundtrip_once(self):
+        from test_authcrypto import envelope
+        headers={'X-Forwarded-Proto':'https','Origin':'https://qa.example.test','Authorization':'Bearer test-capability'}
+        _,status=await self.post(headers)
+        encrypted=envelope(status['encryption'])
+        code,data=await self.post(headers,{'encrypted':encrypted},'/auth/code')
+        self.assertEqual(code,200)
+        self.login.submit.assert_awaited_once_with('LOCAL_TEST_CODE')
+        code,data=await self.post(headers,{'encrypted':encrypted},'/auth/code')
+        self.assertEqual((code,data['error']),(400,'encrypted_input_invalid'))
+        self.login.submit.assert_awaited_once()
+
+    async def test_verified_headerless_peer_fallback(self):
+        with patch('agent.tlsverify.PublicTLS.accepts',AsyncMock(return_value=True)):
+            code,data=await self.post({'Origin':'https://qa.example.test'}, {'session_token':'test-capability'})
+            self.assertEqual(code,200)
+            self.assertIn('encryption',data)
+
+    async def test_unverified_headerless_peer_denied(self):
+        with patch('agent.tlsverify.PublicTLS.accepts',AsyncMock(return_value=False)):
+            code,data=await self.post({'Origin':'https://qa.example.test'}, {'session_token':'test-capability'})
+            self.assertEqual((code,data['error']),(403,'https_not_confirmed'))
