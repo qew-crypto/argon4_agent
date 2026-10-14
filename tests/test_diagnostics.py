@@ -62,3 +62,30 @@ class DiagnosticAsyncTests(unittest.IsolatedAsyncioTestCase):
                 await login.verify(delay=0)
             self.assertIn('OAUTH_CODE_REJECTED',login.diagnostic)
             capture.assert_not_awaited()
+
+class ExcerptTests(unittest.TestCase):
+    def test_unknown_message_is_actionable(self):
+        from agent.diagnostics import error_excerpt
+        text=error_excerpt({'error': {'message':'Agent backend returned an unexpected state'}})
+        self.assertIn('unexpected state',text)
+
+    def test_credentials_and_urls_redacted(self):
+        from agent.diagnostics import redacted_excerpt
+        text=redacted_excerpt('Error at https://example.test/?x=PRIVATE\naccess_token=PRIVATE_VALUE\nmail: user@example.test\nBearer PRIVATE_BEARER_VALUE')
+        for secret in ('PRIVATE','user@example.test','https://'):
+            self.assertNotIn(secret,text)
+
+    def test_long_unlabelled_token_redacted(self):
+        from agent.diagnostics import redacted_excerpt
+        secret='aZ9_'*12
+        self.assertNotIn(secret,redacted_excerpt('Failed request '+secret))
+
+    def test_nested_credentials_not_selected(self):
+        from agent.diagnostics import error_excerpt
+        result=error_excerpt({'error':{'message':'Failed to start backend','credentials':{'refresh_token':'PRIVATE'}}})
+        self.assertIn('Failed to start backend',result)
+        self.assertNotIn('PRIVATE',result)
+
+    def test_excerpt_is_bounded(self):
+        from agent.diagnostics import redacted_excerpt
+        self.assertLessEqual(len(redacted_excerpt('Something failed. '*1000)),500)

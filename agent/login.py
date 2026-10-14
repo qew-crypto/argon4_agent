@@ -14,7 +14,7 @@ import termios
 import time
 from urllib.parse import urlsplit
 from .common import capture_process
-from .diagnostics import known_failure, decode_envelope, diagnosis
+from .diagnostics import known_failure, decode_envelope, diagnosis, error_excerpt
 
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 LINK = re.compile(r'\x1b\]8;[^;]*;(https?://[^\x07\x1b]+)')
@@ -40,11 +40,14 @@ class Login:
         self.fd = None
         self.task = None
         self.verify_task = None
+        self.startup_task = None
         self.buffer = ''
         self.selected = False
         self.submitted = False
         self.diagnostic = ''
         self.oauth_failure = None
+        self.startup_fallback = False
+        self.terminal_tail = b''
         self.lock = asyncio.Lock()
 
     async def start(self):
@@ -55,6 +58,8 @@ class Login:
             self.url = None
             self.diagnostic = ''
             self.oauth_failure = None
+            self.startup_fallback = False
+            self.terminal_tail = b''
             self.deadline = time.monotonic() + 600
             self.buffer = ''
             self.selected = self.submitted = False
@@ -77,6 +82,7 @@ class Login:
             os.set_blocking(master, False)
             self.fd = master
             self.task = asyncio.create_task(self.monitor())
+            self.startup_task = asyncio.create_task(self.startup_watchdog())
             return self.token
 
     def valid(self, token):
@@ -116,9 +122,11 @@ class Login:
                     continue
                 except OSError:
                     break
-                if b'\x1b]11;?' in chunk:
+                terminal = self.terminal_tail + chunk
+                self.terminal_tail = terminal[-16:]
+                if b'\x1b]11;?' in terminal:
                     os.write(self.fd, b'\x1b]11;rgb:0000/0000/0000\x07')
-                if b'\x1b[6n' in chunk:
+                if b'\x1b[6n' in terminal:
                     os.write(self.fd, b'\x1b[1;1R')
                 if self.submitted:
                     # Inspect only for fixed error categories; do not keep/return echoed code.
@@ -145,6 +153,24 @@ class Login:
         finally:
             if self.stage in ('expired', 'error', 'already_signed_in'):
                 self.terminate()
+
+    async def startup_watchdog(self, wait=30):
+        try:
+            await asyncio.sleep(wait)
+            if self.stage != 'starting' or self.url:
+                return
+            self.startup_fallback = True
+            self.stage = 'checking'
+            self.diagnostic = 'STARTUP_TIMEOUT: CLI не выдал ссылку за 30 секунд; проверяю сохранённую авторизацию.'
+            print('LOGIN_STARTUP: STARTUP_TIMEOUT; checking saved profile.', flush=True)
+            # Stop the unread/unrecognised interactive UI before the independent probe.
+            if self.task and not self.task.done():
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
+            self.terminate()
+            self.verify_task = asyncio.create_task(self.verify(delay=0))
+        except asyncio.CancelledError:
+            pass
 
     async def verify(self, delay=15):
         # Separate stderr is classified internally, never forwarded as raw text.
@@ -175,6 +201,8 @@ class Login:
                     category = 'CLI_OUTPUT_FORMAT' if not data else 'UNKNOWN_CLI_ERROR'
                 self.stage = 'check_failed'
                 self.diagnostic = diagnosis(category, exit_code=code, phase='model')
+                if category in ('UNKNOWN_CLI_ERROR', 'CLI_OUTPUT_FORMAT'):
+                    self.diagnostic += '\nCLI (очищено): ' + error_excerpt(data, text, stderr)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -188,6 +216,8 @@ class Login:
             self.diagnostic = diagnosis('INTERNAL_ERROR')
         finally:
             self.terminate()
+            if self.startup_fallback and self.stage == 'check_failed':
+                self.diagnostic = 'STARTUP_TIMEOUT → ' + self.diagnostic
             if self.diagnostic:
                 print('LOGIN_CHECK: ' + self.diagnostic, flush=True)
 
@@ -205,12 +235,12 @@ class Login:
         self.buffer = ''
 
     async def stop(self):
-        tasks = [t for t in (self.task, self.verify_task) if t and not t.done()]
+        tasks = [t for t in (self.task, self.verify_task, self.startup_task) if t and not t.done()]
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self.task = self.verify_task = None
+        self.task = self.verify_task = self.startup_task = None
         self.terminate()
         self.token = None
         self.stage = 'idle'

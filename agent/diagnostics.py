@@ -77,3 +77,36 @@ def diagnosis(name, exit_code=None, phase=None):
     if phase in ('oauth','model','startup'):
         suffix += '; этап=' + phase
     return f'{name}: {MESSAGES[name]}{suffix}'
+
+
+def redacted_excerpt(text, limit=500):
+    """Best-effort redacted error excerpt; never use on arbitrary application/user data."""
+    import re
+    text = str(text)[:6000]
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = re.sub(r'(?i)https?://[^\s\"\']+', '[URL скрыт]', text)
+    text = re.sub(r'(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b', '[email скрыт]', text)
+    text = re.sub(r'(?i)\bBearer\s+[^\s,;\"\']+', 'Bearer [скрыто]', text)
+    # Remove the rest of any line containing a credential assignment, not just
+    # one guessed token shape. No unredacted structured credential fields follow it.
+    text = re.sub(r'''(?im)["']?[A-Za-z0-9_-]*(?:token|password|secret|credential|authorization|cookie|api[_-]?key|code)[A-Za-z0-9_-]*["']?\s*[:=][^\r\n]*''', '[секретные поля скрыты]', text)
+    text = re.sub(r'[A-Za-z0-9_+/=-]{24,}', '[длинный идентификатор скрыт]', text)
+    text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP скрыт]', text)
+    text = re.sub(r'\b\d{12,}\b', '[числовой идентификатор скрыт]', text)
+    text = '\n'.join(line.strip() for line in text.splitlines() if line.strip())
+    return text[:limit]
+
+
+def error_excerpt(envelope, stdout='', stderr=''):
+    fragments = []
+    if isinstance(envelope, dict):
+        error = envelope.get('error')
+        if isinstance(error, str):
+            fragments.append(error)
+        elif isinstance(error, dict):
+            for key in ('message', 'description', 'reason', 'type'):
+                if isinstance(error.get(key), str):
+                    fragments.append(key + ': ' + error[key])
+    if not fragments:
+        fragments.append(stderr or stdout or 'CLI did not provide an error message')
+    return redacted_excerpt('\n'.join(fragments))

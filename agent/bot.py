@@ -83,6 +83,7 @@ async def command(update: Update, context):
             async with LOCK:
                 try:
                     LOGIN.oauth_failure = None
+                    LOGIN.startup_fallback = False
                     await LOGIN.verify(delay=0)
                     await reply(update, LOGIN.diagnostic or 'Проверка не вернула диагностику.')
                 except asyncio.CancelledError:
