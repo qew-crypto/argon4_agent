@@ -13,7 +13,8 @@ import subprocess
 import termios
 import time
 from urllib.parse import urlsplit
-from .common import process
+from .common import capture_process
+from .diagnostics import known_failure, decode_envelope, diagnosis
 
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 LINK = re.compile(r'\x1b\]8;[^;]*;(https?://[^\x07\x1b]+)')
@@ -42,6 +43,8 @@ class Login:
         self.buffer = ''
         self.selected = False
         self.submitted = False
+        self.diagnostic = ''
+        self.oauth_failure = None
         self.lock = asyncio.Lock()
 
     async def start(self):
@@ -50,6 +53,8 @@ class Login:
             self.token = secrets.token_urlsafe(32)
             self.stage = 'starting'
             self.url = None
+            self.diagnostic = ''
+            self.oauth_failure = None
             self.deadline = time.monotonic() + 600
             self.buffer = ''
             self.selected = self.submitted = False
@@ -83,7 +88,7 @@ class Login:
 
     def status(self):
         # No raw CLI output, authorization code, credentials or logs leave this object.
-        return {'stage': self.stage, 'google_url': self.url if self.stage == 'waiting_code' else None}
+        return {'stage': self.stage, 'google_url': self.url if self.stage == 'waiting_code' else None, 'diagnostic': self.diagnostic}
 
     async def submit(self, code):
         async with self.lock:
@@ -116,6 +121,10 @@ class Login:
                 if b'\x1b[6n' in chunk:
                     os.write(self.fd, b'\x1b[1;1R')
                 if self.submitted:
+                    # Inspect only for fixed error categories; do not keep/return echoed code.
+                    category = known_failure(ANSI.sub('', chunk.decode(errors='replace')))
+                    if category in ('OAUTH_CODE_REJECTED', 'KEYRING_ERROR') and not self.oauth_failure:
+                        self.oauth_failure = category
                     continue
                 self.buffer = (self.buffer + chunk.decode(errors='replace'))[-120000:]
                 plain = ANSI.sub('', self.buffer)
@@ -137,27 +146,50 @@ class Login:
             if self.stage in ('expired', 'error', 'already_signed_in'):
                 self.terminate()
 
-    async def verify(self):
-        # A live minimal model request is the success criterion, not a guessed UI label.
+    async def verify(self, delay=15):
+        # Separate stderr is classified internally, never forwarded as raw text.
         env = {k: v for k, v in os.environ.items() if not any(
             x in k.upper() for x in ('TOKEN', 'KEY', 'SECRET', 'PASSWORD'))}
         env['HOME'] = str(self.home)
+        self.stage = 'checking'
+        self.diagnostic = ''
         try:
-            await asyncio.sleep(10)
-            code, text = await process(['agy', '-p', 'Reply exactly OK. Do not use tools.',
-                '--mode', 'plan', '--disable-slash-commands', '--output-format', 'json'],
-                cwd=self.root, timeout=90, env=env, limit=30000, merge_stderr=False)
-            import json
-            data = json.loads(text)
-            if code == 0 and data.get('status') == 'SUCCESS' and data.get('response'):
+            if delay:
+                await asyncio.sleep(delay)
+            if self.oauth_failure:
+                self.stage = 'check_failed'
+                self.diagnostic = diagnosis(self.oauth_failure, phase='oauth')
+                return
+            code, text, stderr = await capture_process(['agy', '-p', 'Reply exactly OK. Do not use tools.',
+                '--mode', 'plan', '--disable-slash-commands', '--output-format', 'json',
+                '--print-timeout', '75s'],
+                cwd=self.root, timeout=90, env=env, limit=30000)
+            data = decode_envelope(text)
+            if code == 0 and data and data.get('status') == 'SUCCESS' and isinstance(data.get('response'), str) and data['response']:
                 self.stage = 'success'
+                self.diagnostic = diagnosis('OK')
                 await self.on_success()
             else:
+                category = known_failure(stderr + '\n' + text)
+                if not category:
+                    category = 'CLI_OUTPUT_FORMAT' if not data else 'UNKNOWN_CLI_ERROR'
                 self.stage = 'check_failed'
+                self.diagnostic = diagnosis(category, exit_code=code, phase='model')
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self.stage = 'check_failed'
+            self.diagnostic = diagnosis('TIMEOUT', phase='model')
+        except FileNotFoundError:
+            self.stage = 'check_failed'
+            self.diagnostic = diagnosis('CLI_NOT_FOUND', phase='startup')
         except Exception:
             self.stage = 'check_failed'
+            self.diagnostic = diagnosis('INTERNAL_ERROR')
         finally:
             self.terminate()
+            if self.diagnostic:
+                print('LOGIN_CHECK: ' + self.diagnostic, flush=True)
 
     def terminate(self):
         if self.proc and self.proc.poll() is None:

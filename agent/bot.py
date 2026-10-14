@@ -71,6 +71,25 @@ async def command(update: Update, context):
         else:
             await reply(update, 'Нет активной задачи.')
         return
+    if cmd == '/checklogin':
+        if LOCK.locked() or (LOGIN and (LOGIN.active() or (LOGIN.verify_task and not LOGIN.verify_task.done()))):
+            await reply(update, 'Сначала дождись текущей задачи/входа или отмени вход через /cancel.')
+            return
+        from . import keyring
+        if not await asyncio.to_thread(keyring.start_keyring):
+            await reply(update, 'Keyring недоступен: ' + keyring.ERROR)
+            return
+        async def check_saved():
+            async with LOCK:
+                try:
+                    LOGIN.oauth_failure = None
+                    await LOGIN.verify(delay=0)
+                    await reply(update, LOGIN.diagnostic or 'Проверка не вернула диагностику.')
+                except asyncio.CancelledError:
+                    await reply(update, 'Проверка входа отменена.')
+        await reply(update, 'Проверяю уже сохранённый вход без нового кода Google. До 90 секунд. Отмена: /cancel. Проверка делает один короткий запрос к модели.')
+        LOGIN.verify_task = asyncio.create_task(check_saved())
+        return
     if cmd == '/login':
         from .web import public_url
         url = public_url()
@@ -101,7 +120,7 @@ async def command(update: Update, context):
         return
     if cmd in ('/start', '/help'):
         await reply(update, 'Личный VPS-агент. Пришли задачу, изображение или файл.\n'
-            '/setup — API URL, ключ, модель или аккаунт Google\n/login — вход Antigravity без терминала\n'
+            '/setup — API URL, ключ, модель или аккаунт Google\n/login — вход Antigravity без терминала\n/checklogin — проверить сохранённый вход без нового кода\n'
             '/mode api | agy — переключить режим\n'
             '/models — модели, доступные по API-ключу\n'
             '/status — состояние без секретов\n'
@@ -111,7 +130,7 @@ async def command(update: Update, context):
     elif cmd == '/status':
         from . import keyring
         d = CONFIG.data
-        await reply(update, f"Режим: {d['mode']}\nKeyring: {keyring.STATUS}\nВход Antigravity: {LOGIN.stage if LOGIN else 'не запущен'}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
+        await reply(update, f"Режим: {d['mode']}\nKeyring: {keyring.STATUS}\nВход Antigravity: {LOGIN.stage if LOGIN else 'не запущен'}\nДиагностика входа: {LOGIN.diagnostic if LOGIN and LOGIN.diagnostic else 'нет'}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
             f"Аккаунт-модель: {d['account_model'] or 'автовыбор CLI'}\n"
             f"API-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
             f"Подтверждения: {os.getenv('CONFIRM_TOOLS', 'on')}\nПапка: {ROOT}")
@@ -374,7 +393,7 @@ def main():
     if history_file.exists():
         HISTORY.extend(json.loads(history_file.read_text())[-24:])
     app = Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
-    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login'):
+    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin'):
         app.add_handler(CommandHandler(name, command))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL, incoming))

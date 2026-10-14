@@ -33,3 +33,23 @@ async def process(argv, *, cwd, timeout, env=None, limit=18000, merge_stderr=Tru
         if stream.read(1):
             result += '\n[вывод обрезан]'
         return p.returncode, result
+
+
+async def capture_process(argv, *, cwd, timeout, env=None, limit=30000):
+    """Separate, bounded stdout/stderr capture. Callers must not expose raw diagnostics."""
+    import tempfile
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        p = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env,
+            stdout=out, stderr=err, start_new_session=True)
+        try:
+            await asyncio.wait_for(p.wait(), timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await p.wait()
+            raise
+        out.seek(0); err.seek(0)
+        return (p.returncode, out.read(limit).decode('utf-8', errors='replace'),
+                err.read(limit).decode('utf-8', errors='replace'))
