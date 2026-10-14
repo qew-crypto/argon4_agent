@@ -1,0 +1,6 @@
+python-telegram-bot>=22.0,<23
+openai>=1.70,<3
+playwright>=1.50,<2
+python-dotenv>=1.0,<2
+pypdf>=5,<7
+aiohttp>=3.11,<4
