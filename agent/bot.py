@@ -80,6 +80,10 @@ async def command(update: Update, context):
         if LOCK.locked():
             await reply(update, 'Сначала останови задачу через /stop.')
             return
+        from . import keyring
+        if not await asyncio.to_thread(keyring.start_keyring):
+            await reply(update, 'Вход Google пока недоступен: Linux keyring не запустился. API-режим работает отдельно. Проверь собственный Dockerfile в панели и строку KEYRING_UNAVAILABLE в логах.\nДиагностика: ' + keyring.ERROR)
+            return
         try:
             token = await LOGIN.start()
         except Exception:
@@ -105,8 +109,9 @@ async def command(update: Update, context):
             '/stop — прервать задачу\n/cancel — отменить настройку\n'
             'Подтверждай действия только после проверки. Вход Google выполняется на VPS, через /login и HTTPS-форму, не паролем в Telegram.')
     elif cmd == '/status':
+        from . import keyring
         d = CONFIG.data
-        await reply(update, f"Режим: {d['mode']}\nВход Antigravity: {LOGIN.stage if LOGIN else 'не запущен'}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
+        await reply(update, f"Режим: {d['mode']}\nKeyring: {keyring.STATUS}\nВход Antigravity: {LOGIN.stage if LOGIN else 'не запущен'}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
             f"Аккаунт-модель: {d['account_model'] or 'автовыбор CLI'}\n"
             f"API-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
             f"Подтверждения: {os.getenv('CONFIRM_TOOLS', 'on')}\nПапка: {ROOT}")
