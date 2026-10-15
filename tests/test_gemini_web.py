@@ -65,7 +65,7 @@ class CookieTests(unittest.TestCase):
         c = Config(self.root)
         self.assertEqual(c.data['mode'], 'web')
         self.assertNotIn('account_model', c.data)
-        self.assertEqual(c.data['max_steps'], 40)
+        self.assertEqual(c.data['max_steps'], 0)
 
     def test_prompt_unicode_and_image_not_sent_as_base64(self):
         result = prompt_text('system', [{'role': 'user', 'content': [
@@ -80,8 +80,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_dispatch_and_close(self):
         with tempfile.TemporaryDirectory() as t:
             provider = Provider(Path(t), Config(t))
-            provider.web.generate = AsyncMock(return_value='{"reply":"ok"}')
-            self.assertEqual(await provider.next('web', [{'role': 'user', 'content': 'hi'}]), {'reply': 'ok'})
+            provider.web.generate = AsyncMock(return_value='{"reply":"ok","status":"completed","evidence":"fixture"}')
+            self.assertEqual(await provider.next('web', [{'role': 'user', 'content': 'hi'}]), {'reply': 'ok', 'status': 'completed', 'evidence': 'fixture'})
             provider.web.close = AsyncMock()
             await provider.close()
             provider.web.close.assert_awaited_once()
@@ -92,7 +92,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             provider = Provider(Path(t), config)
             create = AsyncMock(return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"reply":"API"}'))]))
             provider.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=AsyncMock())
-            self.assertEqual(await provider.next('api', []), {'reply': 'API'})
+            self.assertEqual(await provider.next('api', []), {'reply': 'API', 'status': 'progress', 'evidence': ''})
             await provider.close()
 
     async def test_profile_must_be_outside_workspace(self):

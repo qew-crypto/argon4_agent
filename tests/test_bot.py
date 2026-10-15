@@ -93,7 +93,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             async with bot.LOCK:
                 await bot.command(self.make_update(7, text='/screen'), SimpleNamespace(args=[]))
             tools.browser_action.assert_awaited_once_with({'action': 'screenshot', 'path': 'output/browser-screen.png'})
-            tools.execute.assert_awaited_once_with('send_file', {'path': 'output/browser-screen.png', 'photo': True})
+            tools.execute.assert_not_awaited()  # screenshot auto-delivers inside Tools
         finally:
             bot.OWNER, bot.TOOLS = old
 
@@ -143,3 +143,77 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
                  bot.SETUP, bot.GOAL, hist, bot.ACTIVE) = old
                 bot.HISTORY[:] = hist
+
+    async def test_unlimited_loop_continues_after_progress_and_more_than_old_budget(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        old = (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+               bot.SETUP, bot.GOAL, list(bot.HISTORY), bot.ACTIVE)
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.STATE = bot.ROOT = Path(t)
+                bot.CONFIG = Config(t); bot.CONFIG.data.update(max_steps=0, task_timeout=0)
+                bot.SETUP = None; bot.HISTORY.clear(); bot.GOAL = ''
+                bot.TOOLS = SimpleNamespace(execute=AsyncMock(side_effect=[f'step {i}' for i in range(45)]))
+                actions = [{'reply': 'Сейчас открою', 'status': 'progress'}]
+                actions += [{'tool': 'browser', 'args': {'action': 'text'}} for _ in range(45)]
+                actions += [{'reply': 'Проверено, готово', 'status': 'completed', 'evidence': 'UI confirmed'}]
+                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=actions))
+                update = self.make_update(7, text='Долгая задача')
+                update.effective_message.document = None; update.effective_message.photo = []
+                with patch.object(bot, 'approve', AsyncMock(return_value=True)):
+                    await bot.incoming(update, SimpleNamespace(bot=None))
+                self.assertEqual(bot.TOOLS.execute.await_count, 45)
+                self.assertEqual(bot.HISTORY[-1]['content'], 'Проверено, готово')
+                self.assertEqual(bot.PROVIDER.next.await_count, 47)
+            finally:
+                (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+                 bot.SETUP, bot.GOAL, hist, bot.ACTIVE) = old
+                bot.HISTORY[:] = hist
+
+    async def test_browser_autonomy_skips_approval_and_unlimited_command(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        old = (bot.OWNER, bot.CONFIG)
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.CONFIG = Config(t)
+                bot.CONFIG.data['autonomy'] = 'browser'
+                u = self.make_update(7, text='/unlimited')
+                with patch.dict('os.environ', {'CONFIRM_TOOLS': 'on'}):
+                    for name in ('browser', 'send_file', 'read_file', 'list_files'):
+                        self.assertTrue(await bot.approve(u, {'tool': name, 'args': {}}))
+                u.effective_message.reply_text.assert_not_awaited()
+                bot.CONFIG.data.update(max_steps=40, task_timeout=1800)
+                await bot.command(u, SimpleNamespace(args=[]))
+                self.assertEqual(Config(t).data['max_steps'], 0)
+                self.assertEqual(Config(t).data['task_timeout'], 0)
+            finally:
+                bot.OWNER, bot.CONFIG = old
+
+    async def test_stop_cancels_unlimited_task(self):
+        import asyncio
+        old = (bot.OWNER, bot.ACTIVE)
+        try:
+            bot.OWNER = 7
+            task = asyncio.create_task(asyncio.sleep(60))
+            bot.ACTIVE = task
+            await bot.command(self.make_update(7, text='/stop'), SimpleNamespace(args=[]))
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            bot.OWNER, bot.ACTIVE = old
+
+    async def test_plain_screenshot_request_during_running_task(self):
+        from unittest.mock import MagicMock
+        old = (bot.OWNER, bot.TOOLS, bot.SETUP)
+        try:
+            bot.OWNER = 7; bot.SETUP = None
+            tools = SimpleNamespace(page=MagicMock(), browser_action=AsyncMock(return_value={'sent': True}))
+            tools.page.is_closed.return_value = False; bot.TOOLS = tools
+            async with bot.LOCK:
+                await bot.incoming(self.make_update(7, text='Пришли скрин браузера'), SimpleNamespace(bot=None))
+            tools.browser_action.assert_awaited_once()
+            self.assertFalse(bot.is_screen_request('Открой example.com и пришли скрин'))
+        finally:
+            bot.OWNER, bot.TOOLS, bot.SETUP = old

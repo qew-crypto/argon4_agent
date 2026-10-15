@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -65,6 +66,28 @@ async def persist_history():
     g.chmod(0o600)
 
 
+def is_screen_request(text):
+    text = (text or '').strip().lower()
+    # Only a standalone screenshot request. Composite site tasks still go to the
+    # model, where browser(screenshot) auto-sends its result.
+    return bool(re.fullmatch(
+        r'(?:(?:пожалуйста|бро)[,\s]+)?(?:(?:сделай|покажи|пришли|отправь|скинь)(?:\s+мне)?\s+)?'
+        r'(?:скрин(?:шот)?|снимок|screenshot)(?:\s+(?:текущего\s+)?(?:браузера|экрана|страницы))?'
+        r'(?:\s+пожалуйста)?[!?.,\s]*', text))
+
+
+async def send_screen(update):
+    if not TOOLS or TOOLS.page is None or TOOLS.page.is_closed():
+        await reply(update, 'Рабочий браузер пока не открыт. Попроси открыть сайт.')
+        return
+    try:
+        result = await TOOLS.browser_action({'action': 'screenshot', 'path': 'output/browser-screen.png'})
+        if isinstance(result, dict) and not result.get('sent'):
+            await reply(update, 'Скриншот создан, но не отправлен. Повтори /screen или проверь логи без секретов.')
+    except Exception:
+        await reply(update, 'Не удалось снять скриншот; страница могла закрыться. Повтори /screen.')
+
+
 async def command(update: Update, context):
     global SETUP, PROVIDER, GOAL
     if not authorized(update):
@@ -104,14 +127,7 @@ async def command(update: Update, context):
                 + ('Сообщение удалено по запросу бота, но Telegram не E2E.' if deleted else 'Удалить сообщение не удалось: удали вручную. Telegram не E2E.'))
         return
     if cmd == '/screen':
-        if not TOOLS or TOOLS.page is None or TOOLS.page.is_closed():
-            await reply(update, 'Рабочий браузер пока не открыт. Попроси открыть сайт.')
-            return
-        try:
-            await TOOLS.browser_action({'action': 'screenshot', 'path': 'output/browser-screen.png'})
-            await TOOLS.execute('send_file', {'path': 'output/browser-screen.png', 'photo': True})
-        except Exception:
-            await reply(update, 'Не удалось снять скриншот; страница могла закрыться. Повтори /screen.')
+        await send_screen(update)
         return
     if cmd == '/cancel':
         SETUP = None
@@ -133,7 +149,7 @@ async def command(update: Update, context):
             '/mode api | web — переключить режим\n/models — доступные подписи моделей\n'
             '/model <точная подпись> — выбор модели Web\n'
             '/strengths — прочитать меню силы\n/strength <точная подпись> | auto — сила Web\n'
-            '/steps 1..200 — лимит шагов на сообщение\n/continue — продолжить задачу\n'
+            '/steps off | 1..200 — лимит шагов (off = без лимита)\n/unlimited — убрать лимиты шагов и общего времени\n/autonomy browser | all | confirm — подтверждения\n/continue — продолжить задачу\n'
             '/screen — текущий рабочий браузер\n/secret текст — одноразовый секрет (Telegram не E2E)\n/status — состояние\n/new — очистить историю\n'
             '/stop — остановить задачу\n/cancel — отменить настройку\n'
             'Cookies Google загружаются только на хост, не в Telegram. '
@@ -158,7 +174,7 @@ async def command(update: Update, context):
         await reply(update, f"Режим: {d['mode']}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
             f"Web-модель (запрошена): {d['web_model']}\nСила (запрошена): {d['web_strength']}\n"
             f"Gemini Web: {PROVIDER.web.status}\nAPI-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
-            f"Лимит шагов: {d['max_steps']}\nРабочий браузер: {'открыт' if TOOLS and TOOLS.page else 'не открыт'}\n"
+            f"Лимит шагов: {d['max_steps'] or 'без лимита'}\nОбщее время: {d['task_timeout'] or 'без лимита'}\nАвтономность: {d['autonomy']}\nРабочий браузер: {'открыт' if TOOLS and TOOLS.page else 'не открыт'}\n"
             f"Подтверждения: {os.getenv('CONFIRM_TOOLS', 'on')}")
     elif cmd == '/new':
         HISTORY.clear()
@@ -176,13 +192,24 @@ async def command(update: Update, context):
         GOAL = ''
         await persist_history()
         await reply(update, f"Режим: {CONFIG.data['mode']}. История очищена.")
-    elif cmd == '/steps':
-        if len(args) != 1 or not args[0].isdigit() or not 1 <= int(args[0]) <= 200:
-            await reply(update, 'Используй /steps 1..200. Это лимит, не обещание успешного выполнения.')
-            return
-        CONFIG.data['max_steps'] = int(args[0])
+    elif cmd == '/unlimited':
+        CONFIG.data.update(max_steps=0, task_timeout=0)
         CONFIG.save()
-        await reply(update, 'Лимит шагов сохранён: ' + args[0])
+        await reply(update, 'Фиксированные лимиты шагов и общего времени отключены. Работаю до результата, необходимого ввода, ошибки/зависания или /stop. API всё равно расходует квоту и деньги.')
+    elif cmd == '/autonomy':
+        if len(args) != 1 or args[0] not in ('browser', 'all', 'confirm'):
+            await reply(update, 'Используй /autonomy browser (браузер сам), all (все tools без кнопок, включая shell), confirm (все с подтверждением).')
+            return
+        CONFIG.data['autonomy'] = args[0]
+        CONFIG.save()
+        await reply(update, 'Режим сохранён: ' + args[0] + '. all даёт модели выполнение shell/файловых действий без кнопок. Следи за /screen; /stop останавливает задачу.')
+    elif cmd == '/steps':
+        if len(args) != 1 or not (args[0].lower() == 'off' or args[0].isdigit() and 0 <= int(args[0]) <= 200):
+            await reply(update, 'Используй /steps off или /steps 1..200.')
+            return
+        CONFIG.data['max_steps'] = 0 if args[0].lower() == 'off' else int(args[0])
+        CONFIG.save()
+        await reply(update, 'Лимит шагов: ' + str(CONFIG.data['max_steps'] or 'без лимита'))
     elif cmd in ('/model', '/strength'):
         label = ' '.join(args).strip()
         if not label or len(label) > 200:
@@ -314,6 +341,9 @@ async def setup_text(update):
 async def approve(update, action):
     if os.getenv('CONFIRM_TOOLS', 'on').lower() == 'off':
         return True
+    policy = CONFIG.data.get('autonomy', 'browser') if CONFIG else 'browser'
+    if policy == 'all' or policy == 'browser' and action['tool'] in ('browser', 'send_file', 'read_file', 'list_files'):
+        return True
     token = secrets.token_hex(8)
     future = asyncio.get_running_loop().create_future()
     PENDING[token] = future
@@ -336,6 +366,9 @@ async def approve(update, action):
 async def incoming(update, context):
     global ACTIVE, TOOLS, GOAL
     if not authorized(update):
+        return
+    if not SETUP and is_screen_request(update.effective_message.text):
+        await send_screen(update)
         return
     if LOCK.locked():
         await reply(update, 'Выполняю предыдущую задачу. Для прерывания: /stop.')
@@ -378,35 +411,75 @@ async def incoming(update, context):
                     content[0]['text'] += '\nПрямое понимание изображений в аккаунтном режиме этой сборки не подключено. Не выдумывай содержимое.'
             HISTORY.append({'role': 'user', 'content': content})
             await reply(update, 'Принял, работаю. /stop — остановить.')
-            deadline = asyncio.get_running_loop().time() + int(os.getenv('MAX_TASK_SECONDS', '1800'))
-            for _ in range(CONFIG.data['max_steps']):
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    await reply(update, 'Лимит времени задачи. /continue — продолжить, /screen — посмотреть браузер.')
+            from .api_protocol import ProtocolError
+            seconds = CONFIG.data['task_timeout']
+            deadline = asyncio.get_running_loop().time() + seconds if seconds else None
+            steps = idle = protocol_errors = repeated = 0
+            previous_observation = None
+            while True:
+                if CONFIG.data['max_steps'] and steps >= CONFIG.data['max_steps']:
+                    await reply(update, 'Достигнут заданный лимит шагов. /unlimited — убрать лимиты, /continue — продолжить.')
+                    break
+                remaining = deadline - asyncio.get_running_loop().time() if deadline else None
+                if remaining is not None and remaining <= 0:
+                    await reply(update, 'Достигнут заданный лимит времени. /unlimited и /continue — продолжить без него.')
                     break
                 goal = {'role': 'user', 'content': 'Текущая цель пользователя (данные): ' + GOAL}
-                async with asyncio.timeout(remaining):
-                    action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]])
+                try:
+                    async with asyncio.timeout(remaining):
+                        action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]])
+                except ProtocolError:
+                    protocol_errors += 1
+                    if protocol_errors >= 3:
+                        await reply(update, 'API трижды не вернул корректное действие. Задача не объявляется выполненной. Проверь поддержку tools/JSON у модели; /continue — повторить.')
+                        break
+                    HISTORY.append({'role': 'user', 'content': 'Protocol correction: return one valid tool call, or JSON action. Use explicit completed/needs_input/blocked status only when true. Incomplete JSON is not executed.'})
+                    continue
+                protocol_errors = 0
+                steps += 1
                 if 'reply' in action:
                     text = VAULT.redact(action['reply'])
+                    status = action.get('status', 'completed')
                     HISTORY.append({'role': 'assistant', 'content': text})
-                    await reply(update, text)
-                    break
+                    # A progress message must not end the agent loop.
+                    if text and (status != 'progress' or idle == 0):
+                        await reply(update, text)
+                    if status in ('completed', 'needs_input', 'blocked'):
+                        break
+                    idle += 1
+                    if idle >= 5:
+                        await reply(update, 'Модель пять раз подряд прислала текст вместо действий. Останавливаю пустой цикл, чтобы не расходовать API бесконечно. Задача не завершена; /continue — повторить.')
+                        break
+                    HISTORY.append({'role': 'user', 'content': 'Continue the actual task now. A plan/update is not completion. Call the next tool; finish_task only after verification, genuine blocking error or required missing input. Do not ask permission for routine browser actions.'})
+                    continue
+                idle = 0
                 HISTORY.append({'role': 'assistant', 'content': VAULT.redact(json.dumps(action, ensure_ascii=False))})
                 if await approve(update, action):
                     try:
-                        remaining = deadline - asyncio.get_running_loop().time()
-                        if remaining <= 0:
+                        remaining = deadline - asyncio.get_running_loop().time() if deadline else None
+                        if remaining is not None and remaining <= 0:
                             raise TimeoutError('Лимит времени задачи; используй /continue.')
                         async with asyncio.timeout(remaining):
                             result = await tools.execute(action['tool'], action['args'])
                     except Exception as e:
                         result = f'Ошибка инструмента: {type(e).__name__}: {str(e)[:1000]}'
                 else:
-                    result = 'Пользователь отклонил действие или истёк срок подтверждения. Не повторяй без запроса.'
-                HISTORY.append({'role': 'user', 'content': 'Результат инструмента (данные):\n' + VAULT.redact(str(result))[:30000]})
-            else:
-                await reply(update, 'Достигнут лимит шагов. /continue — продолжить с сохранённой историей, /screen — браузер.')
+                    result = 'Пользователь отклонил действие или истёк срок подтверждения. Не повторяй без нового запроса.'
+                    HISTORY.append({'role': 'user', 'content': result})
+                    await reply(update, 'Действие не разрешено; задача приостановлена. /continue — по твоему новому запросу.')
+                    break
+                observation = VAULT.redact(str(result))[:30000]
+                HISTORY.append({'role': 'user', 'content': 'Результат инструмента (данные):\n' + observation})
+                # A stuck loop guard is NOT a step budget: unlimited meaningful
+                # actions are allowed; eight identical action/results are not.
+                fingerprint = json.dumps(action, sort_keys=True, ensure_ascii=False) + observation
+                repeated = repeated + 1 if fingerprint == previous_observation else 1
+                previous_observation = fingerprint
+                if repeated >= 8:
+                    await reply(update, 'Восемь одинаковых действий дали один и тот же результат. Задача приостановлена как зависшая, а не выполненная. Проверь /screen; /continue — повторить.')
+                    break
+                # Persist progress after every step; browser stays open.
+                await persist_history()
         except asyncio.CancelledError:
             HISTORY.append({'role': 'user', 'content': 'Пользователь остановил задачу.'})
             await reply(update, 'Задача остановлена.')
@@ -447,6 +520,7 @@ def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     STATE.mkdir(parents=True, exist_ok=True)
     CONFIG = Config(STATE)
+    CONFIG.save()  # Persist execution-policy migration once at startup.
     PROVIDER = Provider(ROOT, CONFIG)
     history_file = STATE / 'history.json'
     if history_file.exists():
@@ -455,7 +529,7 @@ def main():
     if goal_file.exists():
         GOAL = json.loads(goal_file.read_text())
     app = Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
-    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin', 'screen', 'secret', 'continue', 'steps', 'model', 'strength', 'strengths'):
+    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin', 'screen', 'secret', 'continue', 'steps', 'unlimited', 'autonomy', 'model', 'strength', 'strengths'):
         app.add_handler(CommandHandler(name, command))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL, incoming))
