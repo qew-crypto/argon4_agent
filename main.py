@@ -11,7 +11,7 @@ def prepare():
     os.environ['HOME'] = str(data / 'home')
     os.environ['TELEGRAM_BOT_TOKEN'] = (os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('BOT_TOKEN') or '')
     if os.getuid() == 0:
-        # D-Bus requires a registered Unix identity, not just a numeric setuid.
+        # Keep container tools unprivileged with a registered Unix identity.
         import pwd
         import subprocess
         try:
@@ -30,9 +30,6 @@ def prepare():
         os.setgroups([])
         os.setgid(10001)
         os.setuid(10001)
-    from agent.keyring import start_keyring
-    start_keyring()  # Optional: failures disable account login, not the whole bot.
-
 
 
 if __name__ == '__main__':

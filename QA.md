@@ -1,47 +1,32 @@
-# QA — Bothost edition
+# QA — Gemini Web / browser / secret revision
 
-Выполнено локально:
-- 61 unittest: paths/symlinks, shell timeout/output/env, ZIP, settings permissions, actions protocol, owner/private-chat allowlist, no key echo, setup saving, Google URL allowlist, no raw PTY in status, auth input validation, token expiration, HTTPS URL validation — PASS.
-- Официальный Antigravity CLI установлен в тестовую папку; реальные --help/модели commands исследованы.
-- Login manager запустил реальный agy в PTY, выбрал Google OAuth, получил официальный accounts.google.com URL и достиг waiting_code — PASS. В Google не входили.
-- Отмена login/PTy процесса — PASS.
-- Локальный HTTP сервис: health, login page/CSP, bearer capability, HTTPS proxy gate, Origin rejection — PASS.
-- Python compileall — PASS.
-- Chromium read/fill/screenshot — проверены в исходной VPS версии; браузерные tools этой версии не изменялись.
+## Executed locally
 
-Не выполнено:
-- Docker build/run (Docker в тестовой среде отсутствует).
-- Live Bothost deployment и реальная роль/права их bind-mount.
-- Google OAuth completion и сохранение/восстановление keyring в контейнере.
-- Реальные Telegram/API запросы (токены не подключены).
-- Gemini 4 Argon доступ и точный provider model ID.
+- Python 3.13, installed `requirements.txt` in a clean virtual environment.
+- `RUN_BROWSER_TESTS=1 CHROMIUM_EXECUTABLE=/usr/bin/chromium python -m unittest discover -s tests -v`: **35 tests passed**, including 2 real Chromium tests using local HTML only.
+- `python -m compileall -q agent main.py tests`: passed.
+- `git diff --check`: passed.
 
-/login — экспериментальная адаптация интерактивного CLI. При изменении UI официальный remote login parser может потребовать обновления. Проверка успеха делает реальный короткий модельный запрос только после ввода кода пользователем на своём deployment.
+Coverage:
+- Owner/private-chat access; API setup and provider dispatch remain functional under mocks.
+- Migration from `agy`/`account` to `web`; old model key discarded.
+- Host cookie JSON/storage-state parsing, domain filtering, permissions, symlink/FIFO/workspace and size rejection.
+- Gemini model/strength selection against a **fixture DOM**, complete JSON response; unavailable model rejected with no prompt sent.
+- API/web provider dispatch, sanitized errors, cancellation closing provider context.
+- Actual Chromium task-browser snapshot with usable selectors, input/select operations, screenshot PNG, no password value in snapshot.
+- `/screen` while task lock is held; uses existing browser and sends owner-only photo/file.
+- Multi-step loop and `/continue` preserving original goal and Tools instance, without closing task browser.
+- `/secret` deletion request, no value in reply/history/goal; expiry, single-use, redaction, masked fill errors.
+- `/health` works; old HTTP `/login` and `/auth/*` removed.
+- Existing path traversal/symlink, file/ZIP, subprocess environment, timeout, output-limit tests.
 
-## Исправление D-Bus startup
+## NOT executed / not claimed
 
-Добавлены 4 теста: отсутствие executable не фатально; ошибка D-Bus сохраняет диагностику и не завершает startup; успешный keyring создает password file с правами 600; URL/параметры секретов не попадают в диагностику. PASS. Реальный D-Bus после этого изменения на Bothost пока не проверен; требуется повторный deploy.
+- No real Telegram bot/token, Google session/cookies, Gemini/Argon generation or live current model/effort menu.
+- No real Bothost deployment or Docker image build in this environment.
+- No guarantee of Google access from Russia or any particular host/region/account.
+- No guarantee that current Gemini UI selectors match every account/language; host-side inspection may require selector overrides or a code update.
+- No guarantee of accuracy on arbitrary tasks, self-directed assessment compliance, image understanding in Web mode, or sandboxing hostile model-generated shell commands.
+- `/secret` is **not E2E** and does not isolate process memory from the host/same-UID code. It is a best-effort short-lived value injection mechanism, not a security audit.
 
-## Form rejection diagnostics
-
-9 новых тестов: canonical HTTPS origin, стандартный Forwarded header, отсутствие TLS без обхода, storage-проверка, различимые ошибки missing/invalid token, JSON capability fallback, отказ неверному Origin без передачи OAuth-кода, malformed JSON. PASS. Локальный Chromium открыл форму с mock responses, проверил JS и восстановление токена после reload: PASS. Реальный HTTPS reverse proxy Bothost пока не проверен.
-
-## Encrypted OAuth code / headerless reverse proxy
-
-61 unit tests PASS: дополнительно RSA/AES envelope, tampering, cross-session rejection, replay, long code, TLS proof failures/peer binding, encrypted HTTP code round-trip, отказ plaintext input, подтверждённый и неподтверждённый headerless proxy.
-
-Локальный integration smoke с Chromium и TLS reverse proxy, намеренно удаляющим ВСЕ forwarded scheme headers: PASS. Проверены публичный proof-круг к тому же backend, private TCP-peer pin, refresh формы, WebCrypto RSA/AES шифрование и дешифрование тестового кода. В теле POST на прокси plaintext кода отсутствовал. Самоподписанный сертификат отвергнут production default CA validation; тестовый успешный контур использовал явно доверенный тестовый CA только в QA harness. Код production не отключает SSL validation.
-
-Живой Bothost round-trip после этих изменений и завершение Google OAuth по-прежнему не проверены — необходимо обновление deployment пользователем.
-
-## Safe login diagnostics
-
-8 новых тестов: отдельные stdout/stderr, allowlisted категории без эха секретов, различие OAuth/keyring/auth, отсутствие ложной квоты по случайным цифрам OAuth-кода, JSON envelope после startup noise, failed/successful verification, отказ модельного запроса при явном invalid_grant. PASS. Всего 61 unit tests.
-
-Реальный установленный CLI без credentials завершился с AUTH_REQUIRED/exit=1, классификатор корректно распознал отказ. Syntax-check JS и повторный локальный TLS-proxy/WebCrypto round-trip PASS. Реальная причина отказа конкретного Bothost аккаунта ещё не определена: теперь её нужно получить через /checklogin или повторный /login.
-
-## Startup watchdog and unknown-error excerpts
-
-4 новых watchdog теста: переход starting→saved verification, ожидание выданного OAuth-code не прерывается, cancellation, STARTUP_TIMEOUT context. 5 новых redaction тестов: unknown message сохраняет смысл, URLs/credential assignments/email скрыты, long unlabelled tokens скрыты, nested credential fields не выбираются, excerpt ограничен 500 символами. Все 61 unittest PASS.
-
-Syntax-check JS PASS. Реальный agy без credentials выдал Google-ссылку, stage waiting_code; новый watchdog не вмешался и корректно отменился. Полный OAuth и конкретный UNKNOWN_CLI_ERROR пользователя ещё не определены — нужен очищенный error excerpt с его deployment.
+GitHub Actions is configured to repeat tests with Playwright Chromium on Python 3.12. CI has not been observed until the branch workflow actually runs.

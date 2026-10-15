@@ -6,3 +6,8 @@ auth
 __pycache__
 .venv
 data
+secrets/
+*cookies*.json
+*storage-state*.json
+*storage_state*.json
+*profile*/

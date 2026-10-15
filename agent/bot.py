@@ -14,6 +14,7 @@ from .common import safe_path
 from .config import Config
 from .provider import Provider
 from .tools import Tools
+from .secrets import SecretVault
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)
@@ -30,8 +31,10 @@ SETUP = None
 LOCK = asyncio.Lock()
 PENDING = {}
 ACTIVE = None
-LOGIN = None
+TOOLS = None
+GOAL = ''
 WEB_RUNNER = None
+VAULT = SecretVault()
 
 
 def authorized(update):
@@ -57,129 +60,165 @@ async def persist_history():
     p = STATE / 'history.json'
     p.write_text(json.dumps(cleaned, ensure_ascii=False), encoding='utf-8')
     p.chmod(0o600)
+    g = STATE / 'goal.json'
+    g.write_text(json.dumps(GOAL, ensure_ascii=False), encoding='utf-8')
+    g.chmod(0o600)
 
 
 async def command(update: Update, context):
-    global SETUP, PROVIDER
+    global SETUP, PROVIDER, GOAL
     if not authorized(update):
         return
     cmd = update.effective_message.text.split()[0].split('@')[0]
+    args = getattr(context, 'args', [])
     if cmd == '/stop':
         if ACTIVE and not ACTIVE.done():
             ACTIVE.cancel()
-            await reply(update, 'Останавливаю текущую задачу. Уже выполненные действия не отменяются.')
+            await reply(update, 'Останавливаю задачу. Выполненные действия не отменяются.')
         else:
             await reply(update, 'Нет активной задачи.')
         return
-    if cmd == '/checklogin':
-        if LOCK.locked() or (LOGIN and (LOGIN.active() or (LOGIN.verify_task and not LOGIN.verify_task.done()))):
-            await reply(update, 'Сначала дождись текущей задачи/входа или отмени вход через /cancel.')
-            return
-        from . import keyring
-        if not await asyncio.to_thread(keyring.start_keyring):
-            await reply(update, 'Keyring недоступен: ' + keyring.ERROR)
-            return
-        async def check_saved():
-            async with LOCK:
-                try:
-                    LOGIN.oauth_failure = None
-                    LOGIN.startup_fallback = False
-                    await LOGIN.verify(delay=0)
-                    await reply(update, LOGIN.diagnostic or 'Проверка не вернула диагностику.')
-                except asyncio.CancelledError:
-                    await reply(update, 'Проверка входа отменена.')
-        await reply(update, 'Проверяю уже сохранённый вход без нового кода Google. До 90 секунд. Отмена: /cancel. Проверка делает один короткий запрос к модели.')
-        LOGIN.verify_task = asyncio.create_task(check_saved())
+    if cmd == '/secret':
+        # Do not append this message to HISTORY, GOAL, disk, or provider input.
+        try:
+            await update.effective_message.delete()
+            deleted = True
+        except Exception:
+            deleted = False
+        parts = (update.effective_message.text or '').split(maxsplit=1)
+        value = parts[1] if len(parts) > 1 else ''
+        if value == 'clear':
+            VAULT.clear()
+            await reply(update, 'Секреты удалены из памяти процесса. Это не удаляет копии у Telegram или на сайте.')
+        elif not value:
+            await reply(update, '/secret текст — одноразовое значение для поля браузера, TTL 15 минут. /secret clear — очистить. Telegram не E2E; cookies Google передавай только через хост.')
+        else:
+            try:
+                key = VAULT.add(value)
+            except ValueError as e:
+                await reply(update, str(e))
+                return
+            await reply(update, 'Сохранено в памяти на 15 минут: ' + key +
+                '. В задаче укажи этот ID или latest и нужное поле/сайт. Значение не передаётся модели; после успешного заполнения повторное использование запрещено. '
+                'Маскирование вывода действует до истечения срока; это не изоляция от администратора или shell. '
+                + ('Сообщение удалено по запросу бота, но Telegram не E2E.' if deleted else 'Удалить сообщение не удалось: удали вручную. Telegram не E2E.'))
         return
-    if cmd == '/login':
-        from .web import public_url
-        url = public_url()
-        if not url:
-            await reply(update, 'В панели Bothost подключи HTTPS-домен и порт 8080, затем добавь PUBLIC_URL=https://твой-домен и перезапусти бот. Пароль Google в чат не отправляй.')
-            return
-        if LOCK.locked():
-            await reply(update, 'Сначала останови задачу через /stop.')
-            return
-        from . import keyring
-        if not await asyncio.to_thread(keyring.start_keyring):
-            await reply(update, 'Вход Google пока недоступен: Linux keyring не запустился. API-режим работает отдельно. Проверь собственный Dockerfile в панели и строку KEYRING_UNAVAILABLE в логах.\nДиагностика: ' + keyring.ERROR)
+    if cmd == '/screen':
+        if not TOOLS or TOOLS.page is None or TOOLS.page.is_closed():
+            await reply(update, 'Рабочий браузер пока не открыт. Попроси открыть сайт.')
             return
         try:
-            token = await LOGIN.start()
+            await TOOLS.browser_action({'action': 'screenshot', 'path': 'output/browser-screen.png'})
+            await TOOLS.execute('send_file', {'path': 'output/browser-screen.png', 'photo': True})
         except Exception:
-            await reply(update, 'Не удалось запустить Antigravity. Проверь сборку контейнера и логи Bothost без секретов.')
-            return
-        await update.effective_message.reply_text('Открой форму входа. Она действует 10 минут; не пересылай ссылку. Войди только на accounts.google.com. Код вводи в форме, не сообщением боту.', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Подключить Google', url=url + '/login#' + token)]]))
+            await reply(update, 'Не удалось снять скриншот; страница могла закрыться. Повтори /screen.')
         return
     if cmd == '/cancel':
         SETUP = None
-        await LOGIN.stop()
-        await reply(update, 'Настройка и ожидающий вход отменены.')
+        await reply(update, 'Настройка отменена. Для остановки задачи: /stop.')
+        return
+    if cmd == '/continue':
+        if not GOAL:
+            await reply(update, 'Нет сохранённой задачи. Пришли новую задачу.')
+            return
+        await incoming(update, context)
         return
     if LOCK.locked():
-        await reply(update, 'Сейчас выполняю задачу. Дождись ответа или используй /stop.')
+        await reply(update, 'Выполняю задачу. /screen — скриншот, /stop — остановить.')
         return
     if cmd in ('/start', '/help'):
-        await reply(update, 'Личный VPS-агент. Пришли задачу, изображение или файл.\n'
-            '/setup — API URL, ключ, модель или аккаунт Google\n/login — вход Antigravity без терминала\n/checklogin — проверить сохранённый вход без нового кода\n'
-            '/mode api | agy — переключить режим\n'
-            '/models — модели, доступные по API-ключу\n'
-            '/status — состояние без секретов\n'
-            '/new — очистить историю\n'
-            '/stop — прервать задачу\n/cancel — отменить настройку\n'
-            'Подтверждай действия только после проверки. Вход Google выполняется на VPS, через /login и HTTPS-форму, не паролем в Telegram.')
+        await reply(update, 'Личный браузерный агент. Пришли задачу или файл.\n'
+            '/setup — API или Gemini Web\n/login — как подключить cookies на хосте\n'
+            '/checklogin — проверить поле чата и выбор модели, без генерации\n'
+            '/mode api | web — переключить режим\n/models — доступные подписи моделей\n'
+            '/model <точная подпись> — выбор модели Web\n'
+            '/strengths — прочитать меню силы\n/strength <точная подпись> | auto — сила Web\n'
+            '/steps 1..200 — лимит шагов на сообщение\n/continue — продолжить задачу\n'
+            '/screen — текущий рабочий браузер\n/secret текст — одноразовый секрет (Telegram не E2E)\n/status — состояние\n/new — очистить историю\n'
+            '/stop — остановить задачу\n/cancel — отменить настройку\n'
+            'Cookies Google загружаются только на хост, не в Telegram. '
+            'Выбор Argon не создаёт доступ, которого нет у аккаунта. Подтверждай внешние действия после проверки.')
+    elif cmd == '/login':
+        await reply(update, 'Antigravity удалён. На хосте положи cookies Google в приватный JSON-файл '
+            'вне workspace (например /app/data/secrets/gemini-cookies.json), права 600, владелец UID 10001. '
+            'Задай GEMINI_COOKIES_FILE с абсолютным путём, пересобери/перезапусти бот, затем /checklogin. '
+            'Формат: JSON cookies браузера или Playwright storage-state; импортируются только cookies google.com. '
+            'Не отправляй cookies, пароль или токены в Telegram/GitHub. Подробно: README. '
+            'Cookie-файл не отменяет региональные ограничения, 2FA и проверки Google.')
+    elif cmd == '/checklogin':
+        await PROVIDER.web.close()  # Reload changed cookies; never announce generation as tested.
+        async with LOCK:
+            try:
+                await reply(update, await PROVIDER.web.check())
+            except Exception as e:
+                from .gemini_web import GeminiWebError
+                await reply(update, str(e) if isinstance(e, GeminiWebError) else 'Проверка недоступна; подробности секретов не выводятся.')
     elif cmd == '/status':
-        from . import keyring
         d = CONFIG.data
-        await reply(update, f"Режим: {d['mode']}\nKeyring: {keyring.STATUS}\nВход Antigravity: {LOGIN.stage if LOGIN else 'не запущен'}\nДиагностика входа: {LOGIN.diagnostic if LOGIN and LOGIN.diagnostic else 'нет'}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
-            f"Аккаунт-модель: {d['account_model'] or 'автовыбор CLI'}\n"
-            f"API-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
-            f"Подтверждения: {os.getenv('CONFIRM_TOOLS', 'on')}\nПапка: {ROOT}")
+        await reply(update, f"Режим: {d['mode']}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
+            f"Web-модель (запрошена): {d['web_model']}\nСила (запрошена): {d['web_strength']}\n"
+            f"Gemini Web: {PROVIDER.web.status}\nAPI-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
+            f"Лимит шагов: {d['max_steps']}\nРабочий браузер: {'открыт' if TOOLS and TOOLS.page else 'не открыт'}\n"
+            f"Подтверждения: {os.getenv('CONFIRM_TOOLS', 'on')}")
     elif cmd == '/new':
         HISTORY.clear()
+        GOAL = ''
         await persist_history()
-        await reply(update, 'История очищена. Рабочие файлы сохранены.')
+        await reply(update, 'История и цель очищены. Файлы и браузер сохранены.')
     elif cmd == '/mode':
-        if not context.args or context.args[0] not in ('api', 'agy'):
-            await reply(update, 'Используй /mode api или /mode agy')
+        if len(args) != 1 or args[0] not in ('api', 'web'):
+            await reply(update, 'Используй /mode api или /mode web')
             return
         SETUP = None
-        CONFIG.data['mode'] = context.args[0]
+        CONFIG.data['mode'] = args[0]
         CONFIG.save()
         HISTORY.clear()
+        GOAL = ''
         await persist_history()
         await reply(update, f"Режим: {CONFIG.data['mode']}. История очищена.")
+    elif cmd == '/steps':
+        if len(args) != 1 or not args[0].isdigit() or not 1 <= int(args[0]) <= 200:
+            await reply(update, 'Используй /steps 1..200. Это лимит, не обещание успешного выполнения.')
+            return
+        CONFIG.data['max_steps'] = int(args[0])
+        CONFIG.save()
+        await reply(update, 'Лимит шагов сохранён: ' + args[0])
+    elif cmd in ('/model', '/strength'):
+        label = ' '.join(args).strip()
+        if not label or len(label) > 200:
+            await reply(update, 'Нужна точная подпись из /models или /strengths; auto оставляет выбор сайта.')
+            return
+        key = 'web_model' if cmd == '/model' else 'web_strength'
+        CONFIG.data[key] = label
+        CONFIG.save()
+        await reply(update, 'Сохранено. Применится перед следующим запросом; /checklogin проверяет выбор. '
+            'auto не гарантирует модель или силу.')
     elif cmd == '/setup':
         SETUP = {'step': 'mode', 'draft': dict(CONFIG.data)}
         await update.effective_message.reply_text('Выбери подключение:', reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton('API + KEY + MODEL', callback_data='setup:api')],
-            [InlineKeyboardButton('Google / Antigravity', callback_data='setup:agy')]]))
-    elif cmd == '/models':
-        if CONFIG.data['mode'] == 'agy':
-            from .common import process
-            import re
-            env = {k:v for k,v in os.environ.items() if not any(x in k.upper() for x in ('TOKEN','KEY','SECRET','PASSWORD'))}
-            try:
-                code, text = await process(['agy', 'models'], cwd=ROOT, timeout=30, env=env, limit=15000, merge_stderr=False)
-                text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
-                if code or 'not signed in' in text.lower() or 'authentication required' in text.lower():
-                    raise RuntimeError('CLI not authenticated')
-                await reply(update, text)
-            except Exception:
-                await reply(update, 'Не удалось получить модели Antigravity. Проверь /login и доступ аккаунта.')
+            [InlineKeyboardButton('Gemini Web (cookies на хосте)', callback_data='setup:web')]]))
+    elif cmd in ('/models', '/strengths'):
+        if CONFIG.data['mode'] == 'web' or cmd == '/strengths':
+            async with LOCK:
+                try:
+                    labels = await PROVIDER.web.available('model' if cmd == '/models' else 'strength')
+                    await reply(update, '\n'.join(labels) or 'Меню пусто или формат интерфейса изменился.')
+                except Exception as e:
+                    from .gemini_web import GeminiWebError
+                    await reply(update, str(e) if isinstance(e, GeminiWebError) else 'Не удалось прочитать меню Gemini.')
             return
         if not CONFIG.data['api_key']:
-            await reply(update, 'Сначала настрой API-ключ через /setup или подключи Antigravity через /login.')
+            await reply(update, 'Сначала настрой API-ключ через /setup.')
             return
         from openai import AsyncOpenAI
         try:
             async with AsyncOpenAI(api_key=CONFIG.data['api_key'],
                 base_url=CONFIG.data['base_url'], timeout=30, max_retries=0) as client:
                 models = await client.models.list()
-                names = sorted(x.id for x in models.data)
-                await reply(update, '\n'.join(names[:120]) or 'Список пуст.')
+                await reply(update, '\n'.join(sorted(x.id for x in models.data)[:120]) or 'Список пуст.')
         except Exception:
-            await reply(update, 'Не удалось получить модели. Проверь API URL, ключ и поддержку /models провайдером.')
+            await reply(update, 'Не удалось получить модели. Проверь API URL, ключ и поддержку /models.')
 
 
 async def callback(update, context):
@@ -201,20 +240,21 @@ async def callback(update, context):
             await q.edit_message_text('Настройка устарела или выполняется задача. Используй /setup снова.')
             return
         mode = data.split(':')[1]
+        if mode not in ('api', 'web'):
+            await q.edit_message_text('Эта настройка устарела. Используй /setup снова.')
+            return
         SETUP['draft']['mode'] = mode
         if mode == 'api':
             SETUP['step'] = 'base_url'
             await q.edit_message_text('Пришли OpenAI-совместимый API URL или «default» для Gemini:\n'
                 'https://generativelanguage.googleapis.com/v1beta/openai/\n/cancel — отменить')
         else:
-            SETUP['step'] = 'account_model'
-            await q.edit_message_text('Пришли точный ID модели или «auto» для автовыбора CLI.\n'
-                'Для Antigravity используй /login: вход без терминала через защищённую форму. '
-                'Не присылай пароль или OAuth-токены в Telegram.')
+            SETUP['step'] = 'web_model'
+            await q.edit_message_text('Пришли точную подпись модели из веб-меню (например Gemini 4 Argon, если доступна) или auto. Cookies — только на хосте, см. /login.')
 
 
 async def setup_text(update):
-    global SETUP, PROVIDER
+    global SETUP, PROVIDER, GOAL
     text = update.effective_message.text or ''
     step = SETUP['step']
     if step == 'mode':
@@ -247,18 +287,26 @@ async def setup_text(update):
         await reply(update, 'Ключ принят. Пришли точный ID модели. '
             'После сохранения /models покажет доступные модели. Отображаемое название не всегда равно API ID.')
         return
-    if step in ('api_model', 'account_model'):
+    if step == 'web_model':
+        if not text.strip() or len(text.strip()) > 200 or '\n' in text.strip():
+            await reply(update, 'Нужна подпись модели одной строкой.')
+            return
+        SETUP['draft']['web_model'] = text.strip()
+        SETUP['step'] = 'web_strength'
+        await reply(update, 'Пришли точную подпись силы/уровня рассуждений из меню Gemini или auto. Отсутствующие настройки бот не подменяет.')
+        return
+    if step in ('api_model', 'web_strength'):
         if not text.strip() or len(text.strip()) > 200 or '\n' in text.strip():
             await reply(update, 'Нужен ID модели одной строкой.')
             return
-        SETUP['draft'][step] = '' if step == 'account_model' and text.strip().lower() == 'auto' else text.strip()
+        SETUP['draft'][step] = text.strip()
         CONFIG.data = SETUP['draft']
         CONFIG.save()
-        if PROVIDER.client:
-            await PROVIDER.client.close()
+        await PROVIDER.close()
         PROVIDER = Provider(ROOT, CONFIG)
         SETUP = None
         HISTORY.clear()
+        GOAL = ''
         await persist_history()
         await reply(update, 'Настройки сохранены, история очищена. /models — список API-моделей; /status — состояние.')
 
@@ -269,7 +317,7 @@ async def approve(update, action):
     token = secrets.token_hex(8)
     future = asyncio.get_running_loop().create_future()
     PENDING[token] = future
-    description = json.dumps(action, ensure_ascii=False)[:3000]
+    description = VAULT.redact(json.dumps(action, ensure_ascii=False))[:3000]
     msg = await update.effective_message.reply_text('Разрешить действие?\n' + description,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Разрешить', callback_data=f'approve:{token}:yes'),
                                           InlineKeyboardButton('Отклонить', callback_data=f'approve:{token}:no')]]))
@@ -286,24 +334,28 @@ async def approve(update, action):
 
 
 async def incoming(update, context):
-    global ACTIVE
+    global ACTIVE, TOOLS, GOAL
     if not authorized(update):
         return
     if LOCK.locked():
         await reply(update, 'Выполняю предыдущую задачу. Для прерывания: /stop.')
-        return
-    if LOGIN and LOGIN.active():
-        await reply(update, 'Сейчас ожидается вход Google. Заверши его в форме или используй /cancel.')
         return
     if SETUP:
         await setup_text(update)
         return
     async with LOCK:
         ACTIVE = asyncio.current_task()
-        tools = Tools(ROOT, context.bot, update.effective_chat.id)
+        if TOOLS is None:
+            TOOLS = Tools(ROOT, context.bot, update.effective_chat.id, vault=VAULT)
+        tools = TOOLS
         try:
             m = update.effective_message
             prompt = m.text or m.caption or 'Посмотри вложение и опиши, что с ним можно сделать.'
+            continuing = prompt.split()[0] == '/continue' or prompt.strip().lower() in ('продолжай', 'продолжи')
+            if continuing:
+                prompt = 'Продолжай сохранённую задачу по истории и результатам инструментов. Не повторяй уже выполненные внешние действия.'
+            else:
+                GOAL = prompt[:20000]
             content = [{'type': 'text', 'text': prompt}]
             attachment = m.document or (m.photo[-1] if m.photo else None)
             if attachment:
@@ -322,36 +374,48 @@ async def incoming(update, context):
                     if path.stat().st_size <= 10 * 1024**2:
                         content.append({'type': 'image_url', 'image_url': {'url':
                             'data:' + mime + ';base64,' + base64.b64encode(path.read_bytes()).decode()}})
-                elif mime.startswith('image/') and CONFIG.data['mode'] in ('account', 'agy'):
+                elif mime.startswith('image/') and CONFIG.data['mode'] == 'web':
                     content[0]['text'] += '\nПрямое понимание изображений в аккаунтном режиме этой сборки не подключено. Не выдумывай содержимое.'
             HISTORY.append({'role': 'user', 'content': content})
             await reply(update, 'Принял, работаю. /stop — остановить.')
-            for _ in range(int(os.getenv('MAX_TOOL_STEPS', '12'))):
-                action = await PROVIDER.next(CONFIG.data['mode'], HISTORY)
-                if 'reply' in action:
-                    HISTORY.append({'role': 'assistant', 'content': action['reply']})
-                    await reply(update, action['reply'])
+            deadline = asyncio.get_running_loop().time() + int(os.getenv('MAX_TASK_SECONDS', '1800'))
+            for _ in range(CONFIG.data['max_steps']):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    await reply(update, 'Лимит времени задачи. /continue — продолжить, /screen — посмотреть браузер.')
                     break
-                HISTORY.append({'role': 'assistant', 'content': json.dumps(action, ensure_ascii=False)})
+                goal = {'role': 'user', 'content': 'Текущая цель пользователя (данные): ' + GOAL}
+                async with asyncio.timeout(remaining):
+                    action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]])
+                if 'reply' in action:
+                    text = VAULT.redact(action['reply'])
+                    HISTORY.append({'role': 'assistant', 'content': text})
+                    await reply(update, text)
+                    break
+                HISTORY.append({'role': 'assistant', 'content': VAULT.redact(json.dumps(action, ensure_ascii=False))})
                 if await approve(update, action):
                     try:
-                        result = await tools.execute(action['tool'], action['args'])
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise TimeoutError('Лимит времени задачи; используй /continue.')
+                        async with asyncio.timeout(remaining):
+                            result = await tools.execute(action['tool'], action['args'])
                     except Exception as e:
                         result = f'Ошибка инструмента: {type(e).__name__}: {str(e)[:1000]}'
                 else:
                     result = 'Пользователь отклонил действие или истёк срок подтверждения. Не повторяй без запроса.'
-                HISTORY.append({'role': 'user', 'content': 'Результат инструмента (данные):\n' + str(result)[:30000]})
+                HISTORY.append({'role': 'user', 'content': 'Результат инструмента (данные):\n' + VAULT.redact(str(result))[:30000]})
             else:
-                await reply(update, 'Достигнут лимит шагов. Пришли «продолжай», если нужно.')
+                await reply(update, 'Достигнут лимит шагов. /continue — продолжить с сохранённой историей, /screen — браузер.')
         except asyncio.CancelledError:
             HISTORY.append({'role': 'user', 'content': 'Пользователь остановил задачу.'})
             await reply(update, 'Задача остановлена.')
         except Exception as e:
             # Never forward provider exceptions; they can contain credential-bearing URLs.
-            await reply(update, f'Задача не завершена ({type(e).__name__}). '
-                'Проверь /setup, доступ к модели и вход CLI на VPS. Секреты не выводятся.')
+            from .gemini_web import GeminiWebError
+            await reply(update, str(e) if isinstance(e, GeminiWebError) else
+                f'Задача не завершена ({type(e).__name__}). Проверь /setup, /checklogin и доступ к модели. Секреты не выводятся.')
         finally:
-            await tools.close()
             await persist_history()
             ACTIVE = None
 
@@ -360,30 +424,24 @@ async def error_handler(update, context):
     logging.error('Telegram handler error: %s', type(context.error).__name__)
 
 
-async def connected():
-    CONFIG.data['mode'] = 'agy'
-    CONFIG.save()
-    HISTORY.clear()
-    await persist_history()
-
-
 async def post_init(application):
-    global LOGIN, WEB_RUNNER
-    from .login import Login
+    global WEB_RUNNER
     from .web import start_server
-    LOGIN = Login(Path.home(), ROOT, connected)
-    WEB_RUNNER = await start_server(LOGIN)
+    WEB_RUNNER = await start_server()
 
 
 async def post_shutdown(application):
-    if LOGIN:
-        await LOGIN.stop()
+    VAULT.clear()
+    if PROVIDER:
+        await PROVIDER.close()
+    if TOOLS:
+        await TOOLS.close()
     if WEB_RUNNER:
         await WEB_RUNNER.cleanup()
 
 
 def main():
-    global CONFIG, PROVIDER
+    global CONFIG, PROVIDER, GOAL
     if not OWNER or not os.getenv('TELEGRAM_BOT_TOKEN'):
         raise SystemExit('Укажи токен и TELEGRAM_OWNER_ID в настройках Bothost. Без allowlist запуск запрещён.')
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -393,8 +451,11 @@ def main():
     history_file = STATE / 'history.json'
     if history_file.exists():
         HISTORY.extend(json.loads(history_file.read_text())[-24:])
+    goal_file = STATE / 'goal.json'
+    if goal_file.exists():
+        GOAL = json.loads(goal_file.read_text())
     app = Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
-    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin'):
+    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin', 'screen', 'secret', 'continue', 'steps', 'model', 'strength', 'strengths'):
         app.add_handler(CommandHandler(name, command))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL, incoming))
