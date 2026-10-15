@@ -5,21 +5,25 @@ from .common import safe_path, process
 
 
 class Tools:
-    def __init__(self, root, bot, chat_id):
+    def __init__(self, root, bot, chat_id, vault=None):
         self.root, self.bot, self.chat_id = root, bot, chat_id
+        self.vault = vault
         self.pw = self.browser = self.context = self.page = None
 
     async def close(self):
-        if self.context:
-            await self.context.close()
-        if self.pw:
-            await self.pw.stop()
+        try:
+            if self.context:
+                await self.context.close()
+        finally:
+            if self.pw:
+                await self.pw.stop()
+            self.pw = self.browser = self.context = self.page = None
 
     async def execute(self, name, a):
         if name == 'shell':
             # Do not inherit provider or Telegram credentials into shell subprocesses.
             env = {k: v for k, v in os.environ.items() if not any(
-                s in k.upper() for s in ('TOKEN', 'KEY', 'SECRET', 'PASSWORD'))}
+                s in k.upper() for s in ('TOKEN', 'KEY', 'SECRET', 'PASSWORD', 'COOKIE', 'AUTH'))}
             code, text = await process(['/bin/bash', '-lc', a['command']],
                 cwd=self.root, timeout=int(os.getenv('SHELL_TIMEOUT', '90')), env=env)
             return f'exit={code}\n{text}'
@@ -76,11 +80,17 @@ class Tools:
         raise ValueError(f'Неизвестный инструмент: {name}')
 
     async def browser_action(self, a):
-        if self.page is None:
+        if self.page is not None and self.page.is_closed():
+            self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        if self.context is None:
             from playwright.async_api import async_playwright
             self.pw = await async_playwright().start()
+            profile = Path(os.getenv('STATE_DIR', str(self.root.parent / 'state'))) / 'task-browser-profile'
+            profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+            profile.chmod(0o700)
+            options = {'executable_path': os.environ['CHROMIUM_EXECUTABLE']} if os.getenv('CHROMIUM_EXECUTABLE') else {}
             self.context = await self.pw.chromium.launch_persistent_context(
-                str(self.root / 'browser-profile'), headless=True, accept_downloads=True)
+                str(profile), headless=True, accept_downloads=True, **options)
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             self.page.set_default_timeout(20000)
         action = a['action']
@@ -90,6 +100,25 @@ class Tools:
             await self.page.goto(a['url'], wait_until='domcontentloaded', timeout=45000)
         elif action == 'click':
             await self.page.locator(a['selector']).click()
+        elif action == 'select':
+            await self.page.locator(a['selector']).select_option(a['text'])
+        elif action == 'press':
+            await self.page.locator(a['selector']).press(a['text'])
+        elif action == 'scroll':
+            await self.page.mouse.wheel(0, max(-5000, min(5000, int(a.get('text', '600')))))
+        elif action == 'wait':
+            await self.page.locator(a['selector']).wait_for(state='visible', timeout=20000)
+        elif action == 'fill_secret':
+            if self.vault is None:
+                raise ValueError('Хранилище секретов недоступно.')
+            key, value = self.vault.resolve(a.get('secret_id', 'latest'))
+            # Return a fixed message. Do NOT snapshot a page that could echo a secret.
+            try:
+                await self.page.locator(a['selector']).fill(value)
+            except Exception:
+                raise ValueError('Не удалось заполнить секрет; значение и диагностика скрыты.') from None
+            self.vault.consume(key)
+            return 'Одноразовый секрет введён в указанное поле. Значение скрыто.'
         elif action == 'fill':
             await self.page.locator(a['selector']).fill(a['text'])
         elif action == 'download':
@@ -111,10 +140,30 @@ class Tools:
         elif action != 'text':
             raise ValueError('Неизвестное действие браузера')
         # Include control metadata, never password values.
-        controls = await self.page.locator('input, button, a, textarea, select').evaluate_all(
-            '''els => els.slice(0,100).map(e => ({tag:e.tagName, id:e.id,
-            name:e.getAttribute('name'), type:e.getAttribute('type'),
-            text:(e.innerText || e.getAttribute('aria-label') || '').slice(0,120)}))''')
+        controls = await self.page.locator('input, button, a, textarea, select, [role="button"], [contenteditable="true"]').evaluate_all(
+            r"""els => els.filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden').slice(0,100).map(e => {
+              let selector = null;
+              const unique = s => { try { return document.querySelectorAll(s).length === 1; } catch { return false; } };
+              const esc = x => CSS.escape(x);
+              if (e.id && unique('#'+esc(e.id))) selector = '#'+esc(e.id);
+              for (const attr of ['data-testid','name','aria-label','placeholder','href']) {
+                if (selector) break;
+                const v = e.getAttribute(attr);
+                if (v) { const s = e.tagName.toLowerCase()+'['+attr+'="'+esc(v)+'"]'; if(unique(s)) selector = s; }
+              }
+              if (!selector) {
+                let node=e, parts=[];
+                while(node && node.nodeType===1 && node!==document.documentElement) {
+                  let i=1, sib=node; while((sib=sib.previousElementSibling)) if(sib.tagName===node.tagName) i++;
+                  parts.unshift(node.tagName.toLowerCase()+':nth-of-type('+i+')');
+                  const s=parts.join(' > '); if(unique(s)) {selector=s;break;} node=node.parentElement;
+                }
+              }
+              return {tag:e.tagName, selector, type:e.getAttribute('type'), disabled:!!e.disabled,
+                text:(e.innerText || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').slice(0,120),
+                checked:['checkbox','radio'].includes(e.type)?e.checked:undefined,
+                options:e.tagName==='SELECT'?Array.from(e.options).slice(0,40).map(o=>({text:o.text,value:o.value})):undefined};
+            })""")
         return {'url': self.page.url,
                 'text': (await self.page.locator('body').inner_text())[:16000],
                 'controls': controls}

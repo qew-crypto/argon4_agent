@@ -64,3 +64,82 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bot.CONFIG, bot.PROVIDER, bot.SETUP, bot.STATE, hist = old
                 bot.HISTORY[:] = hist
+
+    async def test_secret_command_deleted_not_in_history_and_not_echoed(self):
+        old = (bot.OWNER, list(bot.HISTORY), bot.GOAL)
+        try:
+            bot.OWNER = 7
+            u = self.make_update(7, text='/secret LOCAL_HANDLER_SECRET')
+            await bot.command(u, SimpleNamespace(args=['LOCAL_HANDLER_SECRET']))
+            u.effective_message.delete.assert_awaited_once()
+            self.assertEqual(bot.HISTORY, old[1])
+            self.assertEqual(bot.GOAL, old[2])
+            for call in u.effective_message.reply_text.await_args_list:
+                self.assertNotIn('LOCAL_HANDLER_SECRET', str(call))
+            self.assertEqual(bot.VAULT.resolve('latest')[1], 'LOCAL_HANDLER_SECRET')
+        finally:
+            bot.VAULT.clear()
+            bot.OWNER, hist, bot.GOAL = old
+            bot.HISTORY[:] = hist
+
+    async def test_screen_works_during_task_and_sends_current_browser(self):
+        from unittest.mock import MagicMock
+        old = (bot.OWNER, bot.TOOLS)
+        try:
+            bot.OWNER = 7
+            tools = SimpleNamespace(page=MagicMock(), browser_action=AsyncMock(), execute=AsyncMock())
+            tools.page.is_closed.return_value = False
+            bot.TOOLS = tools
+            async with bot.LOCK:
+                await bot.command(self.make_update(7, text='/screen'), SimpleNamespace(args=[]))
+            tools.browser_action.assert_awaited_once_with({'action': 'screenshot', 'path': 'output/browser-screen.png'})
+            tools.execute.assert_awaited_once_with('send_file', {'path': 'output/browser-screen.png', 'photo': True})
+        finally:
+            bot.OWNER, bot.TOOLS = old
+
+    async def test_steps_validation(self):
+        from pathlib import Path
+        old = (bot.OWNER, bot.CONFIG)
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.CONFIG = Config(t)
+                await bot.command(self.make_update(7, text='/steps 80'), SimpleNamespace(args=['80']))
+                self.assertEqual(Config(t).data['max_steps'], 80)
+                await bot.command(self.make_update(7, text='/steps 9999'), SimpleNamespace(args=['9999']))
+                self.assertEqual(Config(t).data['max_steps'], 80)
+            finally:
+                bot.OWNER, bot.CONFIG = old
+
+    async def test_multistep_continue_preserves_goal_and_browser_tools(self):
+        from pathlib import Path
+        from unittest.mock import patch
+        old = (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+               bot.SETUP, bot.GOAL, list(bot.HISTORY), bot.ACTIVE)
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.STATE = bot.ROOT = Path(t)
+                bot.CONFIG = Config(t); bot.CONFIG.data['max_steps'] = 2
+                bot.SETUP = None; bot.HISTORY.clear(); bot.GOAL = ''
+                tools = SimpleNamespace(execute=AsyncMock(return_value='saved'), close=AsyncMock())
+                bot.TOOLS = tools
+                step = {'tool': 'list_files', 'args': {'path': '.'}}
+                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=[step, step, {'reply': 'finished'}]))
+                first = self.make_update(7, text='Сделай большую задачу')
+                first.effective_message.document = None; first.effective_message.photo = []
+                with patch.object(bot, 'approve', AsyncMock(return_value=True)):
+                    await bot.incoming(first, SimpleNamespace(bot=None))
+                    self.assertEqual(tools.execute.await_count, 2)
+                    self.assertEqual(bot.GOAL, 'Сделай большую задачу')
+                    following = self.make_update(7, text='/continue')
+                    following.effective_message.document = None; following.effective_message.photo = []
+                    await bot.command(following, SimpleNamespace(bot=None, args=[]))
+                self.assertEqual(bot.GOAL, 'Сделай большую задачу')
+                self.assertIs(bot.TOOLS, tools)
+                tools.close.assert_not_awaited()
+                self.assertEqual(bot.HISTORY[-1]['content'], 'finished')
+                self.assertEqual(bot.PROVIDER.next.await_args.args[1][0]['content'],
+                    'Текущая цель пользователя (данные): Сделай большую задачу')
+            finally:
+                (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+                 bot.SETUP, bot.GOAL, hist, bot.ACTIVE) = old
+                bot.HISTORY[:] = hist

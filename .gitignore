@@ -8,3 +8,10 @@ __pycache__/
 *.pyc
 .venv/
 data/
+
+# Never publish exported browser state or cookies
+*cookies*.json
+*storage-state*.json
+*storage_state*.json
+*profile*/
+secrets/
