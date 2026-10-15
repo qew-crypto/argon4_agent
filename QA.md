@@ -1,12 +1,19 @@
-# QA — autonomous API loop / multi-field secrets revision
+# QA — whole-goal completion gate / live command revision
 
 ## Executed locally
 
 - Published-base code from merged PR #1; Python 3.13 clean venv.
-- `RUN_BROWSER_TESTS=1 CHROMIUM_EXECUTABLE=/usr/bin/chromium python -m unittest discover -s tests -v`: **51 tests passed**, including **4 real Chromium local-HTML smoke tests**.
+- `RUN_BROWSER_TESTS=1 CHROMIUM_EXECUTABLE=/usr/bin/chromium python -m unittest discover -s tests -v`: **56 tests passed**, including **4 real Chromium local-HTML smoke tests**.
 - `python -m compileall -q agent main.py tests` and `git diff --check`: passed.
 
-New regression coverage:
+New v3 regression coverage:
+- Whole-test goal + active question 1 + Save/Next rejects premature completion. Single-question requests are not expanded to whole workflows.
+- Actor claims question 1 done -> completion veto -> forced next concrete action -> answer selection and save/next -> final submitted observation -> independent approval -> one real final reply, with no additional user message.
+- Forced API step excludes finish_task/report_progress and uses required tool choice. Read-only reviewer JSON is validated strictly; string "false" is not boolean approval.
+- /status, /autonomy, /unlimited and /commands execute during the task lock; an explicit autonomy change resolves an already pending matching tool approval.
+- Registered menu contains new commands; unknown command answers with build ID rather than silently disappearing.
+
+Earlier regression coverage retained:
 - Native OpenAI-compatible browser/finish/progress calls; unsupported tools 400 -> JSON fallback, cached for subsequent calls; invalid/truncated JSON not executed; legacy/plain reply becomes progress, not implicit completion.
 - 45 useful tool steps after a progress message, beyond the old 40-step cap; explicit completion only then. `/unlimited` resets steps/total deadline. `/stop` cancels an active task.
 - Default browser autonomy skips approval buttons for browser/read/list/send tools.
@@ -25,3 +32,5 @@ New regression coverage:
 - `/secret` remains non-E2E, best-effort redaction, not a sandbox against host/same-UID code. Screenshots may show unmasked private data to the owner.
 
 CI is configured to repeat tests with Python 3.12 and Playwright Chromium; its final status must be checked on the PR separately.
+
+No live user API, live Telegram menu update/network delivery or Bothost deployment was performed. Completion review is a model-based check with a deterministic active-question veto, not a proof system or a guarantee of task success. It adds API usage. Build ID: whole-goal-gate-v3.
