@@ -48,3 +48,39 @@ class VaultTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('LOCAL_TEST_SECRET', str(e.exception))
             self.assertEqual(vault.resolve(key)[1], 'LOCAL_TEST_SECRET')
             vault.clear()
+
+    async def test_split_fio_without_model_or_repeated_secret(self):
+        from agent.secrets import field_values
+        fields = [{'selector': '#surname', 'part': 'surname'}, {'selector': '#name', 'part': 'given_name'},
+                  {'selector': '#patronymic', 'part': 'patronymic'}]
+        self.assertEqual(field_values('Иванов Иван Иванович', fields), ['Иванов', 'Иван', 'Иванович'])
+        import json
+        compound = json.dumps({'фамилия': 'Иванов Петров', 'имя': 'Иван', 'отчество': 'Иванович'})
+        self.assertEqual(field_values(compound, fields)[0], 'Иванов Петров')
+        with self.assertRaises(ValueError):
+            field_values('Иванов Петров Иван Иванович', fields)
+        self.assertEqual(field_values('{"email":"LOCAL_EMAIL","password":"LOCAL_PASSWORD"}',
+            [{'selector': '#email', 'key': 'email'}, {'selector': '#password', 'key': 'password'}], 'json'),
+            ['LOCAL_EMAIL', 'LOCAL_PASSWORD'])
+
+    async def test_fill_secret_form_consumes_once_and_never_returns_values(self):
+        with tempfile.TemporaryDirectory() as t:
+            vault = SecretVault(); key = vault.add('Иванов Иван Иванович')
+            tools = Tools(Path(t), None, 1, vault=vault)
+            targets = []
+            for _ in range(3):
+                field = MagicMock(); field.fill = AsyncMock(); field.count = AsyncMock(return_value=1)
+                field.is_visible = AsyncMock(return_value=True); field.is_editable = AsyncMock(return_value=True)
+                targets.append(field)
+            tools.page = MagicMock(); tools.page.is_closed.return_value = False
+            tools.page.locator.side_effect = targets; tools.context = MagicMock()
+            result = await tools.browser_action({'action': 'fill_secret_form', 'secret_id': key,
+                'fields': [{'selector': '#surname', 'part': 'surname'}, {'selector': '#name', 'part': 'given_name'},
+                           {'selector': '#patronymic', 'part': 'patronymic'}]})
+            for field, value in zip(targets, ['Иванов', 'Иван', 'Иванович']):
+                field.fill.assert_awaited_once_with(value)
+                self.assertNotIn(value, result)
+                self.assertNotIn(value, vault.redact('На странице: ' + value))
+            with self.assertRaises(ValueError):
+                vault.resolve(key)
+            vault.clear()

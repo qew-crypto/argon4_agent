@@ -13,12 +13,25 @@ class Config:
             'api_model': os.getenv('API_MODEL', ''),
             'web_model': os.getenv('GEMINI_WEB_MODEL', 'Gemini 4 Argon'),
             'web_strength': os.getenv('GEMINI_WEB_STRENGTH', 'auto'),
-            'max_steps': max(1, min(200, int(os.getenv('MAX_TOOL_STEPS', '40')))),
+            'max_steps': max(0, min(200, int(os.getenv('MAX_TOOL_STEPS', '0')))),
+            'task_timeout': max(0, int(os.getenv('MAX_TASK_SECONDS', '0'))),
+            'autonomy': os.getenv('AUTONOMY_MODE', 'browser'),
+            'execution_version': 2,
         }
         if self.path.exists():
-            self.data.update(json.loads(self.path.read_text()))
+            saved = json.loads(self.path.read_text())
+            if saved.get('execution_version', 1) < 2:
+                # Old per-message step budgets caused premature stops. Explicit
+                # environment limits can still be used, otherwise remove the cap.
+                saved['max_steps'] = int(os.getenv('MAX_TOOL_STEPS', '0'))
+                saved['task_timeout'] = int(os.getenv('MAX_TASK_SECONDS', '0'))
+                saved['execution_version'] = 2
+            self.data.update(saved)
 
-        self.data['max_steps'] = max(1, min(200, int(self.data['max_steps'])))
+        self.data['max_steps'] = max(0, min(200, int(self.data['max_steps'])))
+        self.data['task_timeout'] = max(0, int(self.data['task_timeout']))
+        if self.data['autonomy'] not in ('browser', 'all', 'confirm'):
+            self.data['autonomy'] = 'browser'
         # Remove obsolete CLI settings, retain API configuration.
         self.data.pop('account_model', None)
         if self.data.get('mode') in ('agy', 'account'):

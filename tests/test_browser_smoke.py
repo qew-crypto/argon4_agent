@@ -61,7 +61,8 @@ class BrowserSmoke(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.page.locator('model-response').count(), 0)
 
     async def test_task_browser_snapshot_fill_screenshot_and_persistence(self):
-        tools = Tools(self.workspace, None, 1)
+        telegram_bot = type('Bot', (), {'send_photo': AsyncMock(), 'send_document': AsyncMock()})()
+        tools = Tools(self.workspace, telegram_bot, 1)
         tools.context = self.page.context; tools.page = self.page
         await self.page.set_content('<input placeholder="visible"><input type="password" value="LOCAL_SECRET"><input hidden id="hidden"><select id="sel"><option value="a">A</option><option value="b">B</option></select>')
         result = await tools.browser_action({'action': 'text'})
@@ -70,7 +71,51 @@ class BrowserSmoke(unittest.IsolatedAsyncioTestCase):
         first = result['controls'][0]['selector']
         await tools.browser_action({'action': 'fill', 'selector': first, 'text': 'hello'})
         await tools.browser_action({'action': 'select', 'selector': '#sel', 'text': 'b'})
-        await tools.browser_action({'action': 'screenshot', 'path': 'output/screen.png'})
+        screenshot = await tools.browser_action({'action': 'screenshot', 'path': 'output/screen.png'})
+        self.assertTrue(screenshot['sent'])
+        telegram_bot.send_photo.assert_awaited_once()
+        await tools.execute('send_file', {'path': 'output/screen.png', 'photo': True})
+        telegram_bot.send_photo.assert_awaited_once()  # no duplicate screenshot
         self.assertTrue((self.workspace / 'output/screen.png').is_file())
         self.assertEqual(await self.page.locator(first).input_value(), 'hello')
         self.assertEqual(await self.page.locator('#sel').input_value(), 'b')
+
+    async def test_one_fio_secret_fills_three_real_inputs(self):
+        from agent.secrets import SecretVault
+        vault = SecretVault(); key = vault.add('Иванов Иван Иванович')
+        try:
+            tools = Tools(self.workspace, None, 1, vault=vault)
+            tools.context = self.page.context; tools.page = self.page
+            await self.page.set_content('<input id="surname"><input id="name"><input id="patronymic">')
+            result = await tools.browser_action({'action': 'fill_secret_form', 'secret_id': key, 'format': 'fio',
+                'fields': [{'selector': '#surname', 'part': 'surname'}, {'selector': '#name', 'part': 'given_name'},
+                           {'selector': '#patronymic', 'part': 'patronymic'}]})
+            for selector, value in (('#surname', 'Иванов'), ('#name', 'Иван'), ('#patronymic', 'Иванович')):
+                self.assertEqual(await self.page.locator(selector).input_value(), value)
+                self.assertNotIn(value, result)
+            with self.assertRaises(ValueError):
+                vault.resolve(key)
+        finally:
+            vault.clear()
+
+    async def test_labeled_fields_custom_editor_and_overlaid_checkbox(self):
+        tools = Tools(self.workspace, None, 1)
+        tools.context = self.page.context; tools.page = self.page
+        await self.page.set_content('''<label for="surname">Фамилия</label><input id="surname" required>
+        <div id="editor" contenteditable="true" role="textbox"></div>
+        <div style="position:relative;width:200px;height:40px">
+        <input type="checkbox" id="agree" style="position:absolute;left:0;top:0">
+        <label for="agree" style="position:absolute;left:0;top:0;width:200px;height:40px;background:lightgray">Согласен</label></div>''')
+        observation = await tools.browser_action({'action': 'text'})
+        field = next(c for c in observation['controls'] if c['selector'] == '#surname')
+        self.assertEqual(field['label'], 'Фамилия')
+        self.assertTrue(field['editable']); self.assertTrue(field['required'])
+        await tools.browser_action({'action': 'fill', 'selector': '#surname', 'text': 'Иванов'})
+        self.assertEqual(await self.page.locator('#surname').input_value(), 'Иванов')
+        await tools.browser_action({'action': 'focus', 'selector': '#editor'})
+        await tools.browser_action({'action': 'type', 'selector': '#editor', 'text': 'hello'})
+        self.assertEqual(await self.page.locator('#editor').inner_text(), 'hello')
+        await tools.browser_action({'action': 'check', 'selector': '#agree'})
+        self.assertTrue(await self.page.locator('#agree').is_checked())
+        await tools.browser_action({'action': 'uncheck', 'selector': '#agree'})
+        self.assertFalse(await self.page.locator('#agree').is_checked())

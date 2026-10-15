@@ -1,4 +1,5 @@
 import os
+import json
 import zipfile
 from pathlib import Path
 from .common import safe_path, process
@@ -8,6 +9,7 @@ class Tools:
     def __init__(self, root, bot, chat_id, vault=None):
         self.root, self.bot, self.chat_id = root, bot, chat_id
         self.vault = vault
+        self.sent_screens = {}
         self.pw = self.browser = self.context = self.page = None
 
     async def close(self):
@@ -65,12 +67,23 @@ class Tools:
             return f'Создан {output.relative_to(self.root)}'
         if name == 'send_file':
             p = safe_path(self.root, a['path'])
+            signature = (p.stat().st_mtime_ns, p.stat().st_size)
+            if self.sent_screens.get(str(p)) == signature:
+                return 'Этот скриншот уже отправлен владельцу; повторная отправка пропущена.'
             if p.stat().st_size > int(os.getenv('MAX_UPLOAD_MB', '49')) * 1024**2:
                 raise ValueError('Файл превышает настроенный лимит Telegram')
             with p.open('rb') as f:
                 if a.get('photo') and p.stat().st_size <= 9 * 1024**2:
-                    await self.bot.send_photo(self.chat_id, photo=f,
-                                              read_timeout=120, write_timeout=120)
+                    from telegram.error import BadRequest
+                    try:
+                        await self.bot.send_photo(self.chat_id, photo=f,
+                                                  read_timeout=120, write_timeout=120)
+                    except BadRequest:
+                        # Tall full-page images can exceed Telegram photo limits.
+                        # Do not retry unknown network failures: delivery may have occurred.
+                        f.seek(0)
+                        await self.bot.send_document(self.chat_id, document=f, filename=p.name,
+                                                     read_timeout=120, write_timeout=120)
                 else:
                     await self.bot.send_document(self.chat_id, document=f, filename=p.name,
                                                  read_timeout=120, write_timeout=120)
@@ -78,6 +91,42 @@ class Tools:
         if name == 'browser':
             return await self.browser_action(a)
         raise ValueError(f'Неизвестный инструмент: {name}')
+
+    async def control(self, selector, editable=False):
+        target = self.page.locator(selector)
+        if await target.count() != 1:
+            raise ValueError('Селектор не определяет один элемент. Сначала browser(text), возьми свежий selector из controls.')
+        if editable:
+            if await target.evaluate('(e) => e.tagName === "LABEL"'):
+                ident = await target.get_attribute('for')
+                if ident:
+                    target = self.page.locator('[id=' + json.dumps(ident) + ']')
+            if not await target.is_editable():
+                child = target.locator('input, textarea, [contenteditable="true"]').filter(visible=True)
+                if await child.count() == 1:
+                    target = child
+                else:
+                    raise ValueError('Это не редактируемое поле. Используй selector поля из controls, а не текст/контейнер. Можно focus/type для нестандартного редактора.')
+        return target
+
+    async def click_control(self, selector, checked=None):
+        target = await self.control(selector)
+        kind = await target.get_attribute('type')
+        if checked is not None and kind not in ('checkbox', 'radio'):
+            raise ValueError('check/uncheck подходят только для checkbox/radio; используй click для других элементов.')
+        if kind in ('checkbox', 'radio'):
+            if checked is not None and await target.is_checked() == checked:
+                return
+            ident = await target.get_attribute('id')
+            label = self.page.locator('label[for=' + json.dumps(ident) + ']').filter(visible=True) if ident else target.locator('xpath=ancestor::label[1]').filter(visible=True)
+            if await label.count() == 1:
+                await label.click()
+            else:
+                await target.click()
+            if checked is not None and await target.is_checked() != checked:
+                raise ValueError('Переключатель не подтвердил нужное состояние; проверь свежий снимок controls.')
+        else:
+            await target.click()
 
     async def browser_action(self, a):
         if self.page is not None and self.page.is_closed():
@@ -99,15 +148,54 @@ class Tools:
                 raise ValueError('Только HTTP/HTTPS')
             await self.page.goto(a['url'], wait_until='domcontentloaded', timeout=45000)
         elif action == 'click':
-            await self.page.locator(a['selector']).click()
+            await self.click_control(a['selector'])
+        elif action in ('check', 'uncheck'):
+            await self.click_control(a['selector'], checked=action == 'check')
+        elif action == 'focus':
+            await (await self.control(a['selector'])).focus()
+        elif action == 'hover':
+            await (await self.control(a['selector'])).hover()
+        elif action == 'type':
+            target = await self.control(a['selector'], editable=True)
+            await target.click()
+            await target.press_sequentially(a['text'])
+        elif action == 'click_at':
+            x, y = float(a['x']), float(a['y'])
+            viewport = await self.page.evaluate('({width:innerWidth,height:innerHeight})')
+            if not 0 <= x < viewport['width'] or not 0 <= y < viewport['height']:
+                raise ValueError('Координаты вне видимого viewport. Используй свежие center из controls или selector.')
+            await self.page.mouse.click(x, y)
         elif action == 'select':
             await self.page.locator(a['selector']).select_option(a['text'])
         elif action == 'press':
-            await self.page.locator(a['selector']).press(a['text'])
+            if a.get('selector'):
+                await (await self.control(a['selector'])).press(a['text'])
+            else:
+                await self.page.keyboard.press(a['text'])
         elif action == 'scroll':
             await self.page.mouse.wheel(0, max(-5000, min(5000, int(a.get('text', '600')))))
         elif action == 'wait':
             await self.page.locator(a['selector']).wait_for(state='visible', timeout=20000)
+        elif action == 'fill_secret_form':
+            if self.vault is None:
+                raise ValueError('Хранилище секретов недоступно.')
+            from .secrets import field_values
+            key, value = self.vault.resolve(a.get('secret_id', 'latest'))
+            fields = a.get('fields')
+            values = field_values(value, fields, a.get('format', 'fio'))
+            # Resolve/validate ALL targets before changing any field.
+            targets = [self.page.locator(f['selector']) for f in fields]
+            for target in targets:
+                if await target.count() != 1 or not await target.is_visible() or not await target.is_editable():
+                    raise ValueError('Не все поля формы доступны однозначно. Секрет не использован, значения скрыты.')
+            self.vault.mask_parts(key, values)
+            try:
+                for target, part in zip(targets, values):
+                    await target.fill(part)
+            except Exception:
+                raise ValueError('Заполнение формы не завершено; часть полей могла измениться. Значения скрыты, секрет не помечен использованным. Проверь поля перед повтором.') from None
+            self.vault.consume(key)
+            return 'Поля формы заполнены из одного секрета: ' + str(len(fields)) + '. Значения не передавались модели. Форма автоматически не отправлялась.'
         elif action == 'fill_secret':
             if self.vault is None:
                 raise ValueError('Хранилище секретов недоступно.')
@@ -120,7 +208,10 @@ class Tools:
             self.vault.consume(key)
             return 'Одноразовый секрет введён в указанное поле. Значение скрыто.'
         elif action == 'fill':
-            await self.page.locator(a['selector']).fill(a['text'])
+            target = await self.control(a['selector'], editable=True)
+            # Playwright.fill focuses the input itself. No extra click/permission
+            # is required; type is available for sites needing keypress events.
+            await target.fill(a['text'])
         elif action == 'download':
             p = safe_path(self.root, a.get('path', 'downloads/file.bin'))
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -136,11 +227,18 @@ class Tools:
             p = safe_path(self.root, a.get('path', 'output/browser.png'))
             p.parent.mkdir(parents=True, exist_ok=True)
             await self.page.screenshot(path=str(p), full_page=True)
-            return f'Скриншот: {p.relative_to(self.root)}'
+            try:
+                await self.execute('send_file', {'path': str(p.relative_to(self.root)), 'photo': True})
+            except Exception:
+                # Capture succeeded, but delivery did not: never claim it sent.
+                return {'path': str(p.relative_to(self.root)), 'sent': False,
+                        'error': 'Скриншот создан, но Telegram не подтвердил отправку. Используй send_file для повторной отправки.'}
+            self.sent_screens[str(p)] = (p.stat().st_mtime_ns, p.stat().st_size)
+            return {'path': str(p.relative_to(self.root)), 'sent': True, 'message': 'Скриншот отправлен владельцу в Telegram.'}
         elif action != 'text':
             raise ValueError('Неизвестное действие браузера')
         # Include control metadata, never password values.
-        controls = await self.page.locator('input, button, a, textarea, select, [role="button"], [contenteditable="true"]').evaluate_all(
+        controls = await self.page.locator('input, button, a, textarea, select, label, [role="button"], [contenteditable="true"]').evaluate_all(
             r"""els => els.filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden').slice(0,100).map(e => {
               let selector = null;
               const unique = s => { try { return document.querySelectorAll(s).length === 1; } catch { return false; } };
@@ -159,7 +257,14 @@ class Tools:
                   const s=parts.join(' > '); if(unique(s)) {selector=s;break;} node=node.parentElement;
                 }
               }
+              const labels = Array.from(e.labels || []).map(l=>l.innerText.trim()).filter(Boolean);
+              const rect = e.getBoundingClientRect(), cx=rect.x+rect.width/2, cy=rect.y+rect.height/2;
               return {tag:e.tagName, selector, type:e.getAttribute('type'), disabled:!!e.disabled,
+                label: labels.join(' / ').slice(0,180), placeholder:e.getAttribute('placeholder'),
+                role:e.getAttribute('role'), required:!!e.required, readonly:!!e.readOnly,
+                editable:(!e.disabled&&!e.readOnly&&(['INPUT','TEXTAREA'].includes(e.tagName)||e.isContentEditable)),
+                label_for:e.tagName==='LABEL'?e.getAttribute('for'):undefined,
+                center:cx>=0&&cy>=0&&cx<innerWidth&&cy<innerHeight?{x:Math.round(cx),y:Math.round(cy)}:null,
                 text:(e.innerText || e.getAttribute('aria-label') || e.getAttribute('placeholder') || '').slice(0,120),
                 checked:['checkbox','radio'].includes(e.type)?e.checked:undefined,
                 options:e.tagName==='SELECT'?Array.from(e.options).slice(0,40).map(o=>({text:o.text,value:o.value})):undefined};
