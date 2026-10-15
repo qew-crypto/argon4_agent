@@ -9,7 +9,7 @@ import secrets
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from .common import safe_path
 from .config import Config
@@ -31,11 +31,38 @@ HISTORY = []
 SETUP = None
 LOCK = asyncio.Lock()
 PENDING = {}
+PENDING_TOOLS = {}
 ACTIVE = None
 TOOLS = None
 GOAL = ''
 WEB_RUNNER = None
 VAULT = SecretVault()
+BUILD = 'whole-goal-gate-v3'
+RUN_STATE = {'phase': 'idle', 'steps': 0, 'reason': 'ещё не запускалась'}
+COMMANDS = (
+    ('start', 'Начать / справка'), ('help', 'Все команды'),
+    ('status', 'Сборка, задача и настройки'), ('stop', 'Остановить задачу'),
+    ('screen', 'Текущий скриншот браузера'), ('continue', 'Продолжить задачу'),
+    ('unlimited', 'Убрать лимиты шагов и времени'),
+    ('autonomy', 'browser / all / confirm'), ('steps', 'off или 1..200'),
+    ('secret', 'Одноразовый секрет; Telegram не E2E'), ('new', 'Очистить историю и цель'),
+    ('setup', 'Настроить API / Gemini Web'), ('cancel', 'Отменить мастер настройки'),
+    ('mode', 'api или web'), ('models', 'Доступные модели'), ('model', 'Выбрать Web-модель'),
+    ('strengths', 'Доступные уровни Web'), ('strength', 'Выбрать уровень Web'),
+    ('login', 'Инструкция cookies на хосте'), ('checklogin', 'Проверить Gemini Web'),
+    ('commands', 'Обновить меню команд Telegram'),
+)
+LIVE_COMMANDS = {'/status', '/help', '/start', '/autonomy', '/unlimited', '/steps', '/commands'}
+
+
+async def sync_commands(telegram_bot):
+    await telegram_bot.set_my_commands([BotCommand(name, description) for name, description in COMMANDS])
+
+
+async def unknown_command(update, context):
+    if authorized(update):
+        await reply(update, 'Неизвестная команда в сборке ' + BUILD + '. /help — список, /commands — обновить меню. Если новой команды нет в /help, на хосте старая сборка: нужна пересборка из актуального main.')
+
 
 
 def authorized(update):
@@ -139,10 +166,16 @@ async def command(update: Update, context):
             return
         await incoming(update, context)
         return
-    if LOCK.locked():
-        await reply(update, 'Выполняю задачу. /screen — скриншот, /stop — остановить.')
+    if LOCK.locked() and cmd not in LIVE_COMMANDS:
+        await reply(update, 'Выполняю задачу. Доступны /status, /screen, /stop, /autonomy, /unlimited, /steps и /help.')
         return
-    if cmd in ('/start', '/help'):
+    if cmd == '/commands':
+        try:
+            await sync_commands(context.bot)
+            await reply(update, 'Меню Telegram обновлено. Сборка: ' + BUILD)
+        except Exception:
+            await reply(update, 'Меню обновить не удалось, но ручной ввод команд работает. Сборка: ' + BUILD)
+    elif cmd in ('/start', '/help'):
         await reply(update, 'Личный браузерный агент. Пришли задачу или файл.\n'
             '/setup — API или Gemini Web\n/login — как подключить cookies на хосте\n'
             '/checklogin — проверить поле чата и выбор модели, без генерации\n'
@@ -151,7 +184,7 @@ async def command(update: Update, context):
             '/strengths — прочитать меню силы\n/strength <точная подпись> | auto — сила Web\n'
             '/steps off | 1..200 — лимит шагов (off = без лимита)\n/unlimited — убрать лимиты шагов и общего времени\n/autonomy browser | all | confirm — подтверждения\n/continue — продолжить задачу\n'
             '/screen — текущий рабочий браузер\n/secret текст — одноразовый секрет (Telegram не E2E)\n/status — состояние\n/new — очистить историю\n'
-            '/stop — остановить задачу\n/cancel — отменить настройку\n'
+            '/stop — остановить задачу\n/cancel — отменить настройку\n/commands — обновить меню Telegram\n'
             'Cookies Google загружаются только на хост, не в Telegram. '
             'Выбор Argon не создаёт доступ, которого нет у аккаунта. Подтверждай внешние действия после проверки.')
     elif cmd == '/login':
@@ -171,7 +204,7 @@ async def command(update: Update, context):
                 await reply(update, str(e) if isinstance(e, GeminiWebError) else 'Проверка недоступна; подробности секретов не выводятся.')
     elif cmd == '/status':
         d = CONFIG.data
-        await reply(update, f"Режим: {d['mode']}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
+        await reply(update, f"Сборка: {BUILD}\nЗадача: {RUN_STATE['phase']}\nШагов: {RUN_STATE['steps']}\nПричина: {RUN_STATE['reason']}\nРежим: {d['mode']}\nAPI-модель: {d['api_model'] or 'не задана'}\n"
             f"Web-модель (запрошена): {d['web_model']}\nСила (запрошена): {d['web_strength']}\n"
             f"Gemini Web: {PROVIDER.web.status}\nAPI-ключ: {'задан' if d['api_key'] else 'не задан'}\n"
             f"Лимит шагов: {d['max_steps'] or 'без лимита'}\nОбщее время: {d['task_timeout'] or 'без лимита'}\nАвтономность: {d['autonomy']}\nРабочий браузер: {'открыт' if TOOLS and TOOLS.page else 'не открыт'}\n"
@@ -202,6 +235,12 @@ async def command(update: Update, context):
             return
         CONFIG.data['autonomy'] = args[0]
         CONFIG.save()
+        # Apply an owner's explicit policy change to an already pending prompt.
+        for token, future in list(PENDING.items()):
+            tool = PENDING_TOOLS.get(token)
+            allowed = args[0] == 'all' or args[0] == 'browser' and tool in ('browser', 'send_file', 'read_file', 'list_files')
+            if allowed and not future.done():
+                future.set_result(True)
         await reply(update, 'Режим сохранён: ' + args[0] + '. all даёт модели выполнение shell/файловых действий без кнопок. Следи за /screen; /stop останавливает задачу.')
     elif cmd == '/steps':
         if len(args) != 1 or not (args[0].lower() == 'off' or args[0].isdigit() and 0 <= int(args[0]) <= 200):
@@ -347,6 +386,7 @@ async def approve(update, action):
     token = secrets.token_hex(8)
     future = asyncio.get_running_loop().create_future()
     PENDING[token] = future
+    PENDING_TOOLS[token] = action['tool']
     description = VAULT.redact(json.dumps(action, ensure_ascii=False))[:3000]
     msg = await update.effective_message.reply_text('Разрешить действие?\n' + description,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Разрешить', callback_data=f'approve:{token}:yes'),
@@ -357,6 +397,7 @@ async def approve(update, action):
         return False
     finally:
         PENDING.pop(token, None)
+        PENDING_TOOLS.pop(token, None)
         try:
             await msg.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -413,10 +454,18 @@ async def incoming(update, context):
             await reply(update, 'Принял, работаю. /stop — остановить.')
             from .api_protocol import ProtocolError
             seconds = CONFIG.data['task_timeout']
-            deadline = asyncio.get_running_loop().time() + seconds if seconds else None
+            started_at = asyncio.get_running_loop().time()
+            deadline = started_at + seconds if seconds else None
             steps = idle = protocol_errors = repeated = 0
             previous_observation = None
+            require_action = False
+            used_browser = False
+            rejected_completions = 0
+            RUN_STATE.update(phase='running', steps=0, reason='выполняется')
             while True:
+                # /unlimited and /steps apply between steps, without restarting.
+                seconds = CONFIG.data['task_timeout']
+                deadline = started_at + seconds if seconds else None
                 if CONFIG.data['max_steps'] and steps >= CONFIG.data['max_steps']:
                     await reply(update, 'Достигнут заданный лимит шагов. /unlimited — убрать лимиты, /continue — продолжить.')
                     break
@@ -427,7 +476,10 @@ async def incoming(update, context):
                 goal = {'role': 'user', 'content': 'Текущая цель пользователя (данные): ' + GOAL}
                 try:
                     async with asyncio.timeout(remaining):
-                        action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]])
+                        if require_action:
+                            action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]], require_action=True)
+                        else:
+                            action = await PROVIDER.next(CONFIG.data['mode'], [goal, *HISTORY[-30:]])
                 except ProtocolError:
                     protocol_errors += 1
                     if protocol_errors >= 3:
@@ -437,15 +489,57 @@ async def incoming(update, context):
                     continue
                 protocol_errors = 0
                 steps += 1
+                RUN_STATE['steps'] = steps
                 if 'reply' in action:
                     text = VAULT.redact(action['reply'])
                     status = action.get('status', 'completed')
+                    if status == 'completed':
+                        from .completion import active_workflow_reason
+                        snapshot = None
+                        # Read-only fresh observation, no click/save/submit replay.
+                        page = getattr(tools, 'page', None)
+                        if page is not None and not page.is_closed() and (used_browser or continuing):
+                            try:
+                                async with asyncio.timeout(30):
+                                    raw = await tools.browser_action({'action': 'text'})
+                                snapshot = json.loads(VAULT.redact(json.dumps(raw, ensure_ascii=False)))
+                            except Exception:
+                                snapshot = {'error': 'Fresh browser observation unavailable; do not assume completion.'}
+                        veto = active_workflow_reason(GOAL, snapshot)
+                        RUN_STATE['phase'] = 'checking_completion'
+                        try:
+                            if veto:
+                                decision = {'approved': False, 'reason': veto}
+                            else:
+                                remaining = deadline - asyncio.get_running_loop().time() if deadline else None
+                                async with asyncio.timeout(remaining):
+                                    decision = await PROVIDER.review_completion(CONFIG.data['mode'], GOAL,
+                                        VAULT.redact(json.dumps(action, ensure_ascii=False)), HISTORY[-24:], snapshot)
+                        except ProtocolError:
+                            decision = {'approved': False, 'reason': 'Completion checker did not return a valid decision. Inspect actual state and continue; do not assert success.'}
+                        RUN_STATE['phase'] = 'running'
+                        if not decision['approved']:
+                            rejected_completions += 1
+                            require_action = True
+                            reason = VAULT.redact(decision['reason'])
+                            RUN_STATE['reason'] = 'продолжаю: ' + reason[:300]
+                            # Rejected "done" never becomes the visible final reply.
+                            HISTORY.append({'role': 'user', 'content': 'Whole-task completion REJECTED: ' + reason +
+                                '\nThe original goal is NOT done. Perform the next concrete tool action now. For an active question, select/fill the answer, save and proceed; do not merely report its solution.'})
+                            if rejected_completions == 1:
+                                await reply(update, 'Проверка показала, что остались шаги. Продолжаю автоматически; /stop — остановить.')
+                            await persist_history()
+                            continue
+                        RUN_STATE.update(phase='completed', reason=VAULT.redact(decision['reason'])[:300])
                     HISTORY.append({'role': 'assistant', 'content': text})
                     # A progress message must not end the agent loop.
                     if text and (status != 'progress' or idle == 0):
                         await reply(update, text)
                     if status in ('completed', 'needs_input', 'blocked'):
+                        if status != 'completed':
+                            RUN_STATE.update(phase=status, reason=text[:300])
                         break
+                    require_action = True
                     idle += 1
                     if idle >= 5:
                         await reply(update, 'Модель пять раз подряд прислала текст вместо действий. Останавливаю пустой цикл, чтобы не расходовать API бесконечно. Задача не завершена; /continue — повторить.')
@@ -453,6 +547,9 @@ async def incoming(update, context):
                     HISTORY.append({'role': 'user', 'content': 'Continue the actual task now. A plan/update is not completion. Call the next tool; finish_task only after verification, genuine blocking error or required missing input. Do not ask permission for routine browser actions.'})
                     continue
                 idle = 0
+                require_action = False
+                if action['tool'] == 'browser':
+                    used_browser = True
                 HISTORY.append({'role': 'assistant', 'content': VAULT.redact(json.dumps(action, ensure_ascii=False))})
                 if await approve(update, action):
                     try:
@@ -481,14 +578,18 @@ async def incoming(update, context):
                 # Persist progress after every step; browser stays open.
                 await persist_history()
         except asyncio.CancelledError:
+            RUN_STATE.update(phase='stopped', reason='команда /stop или отмена')
             HISTORY.append({'role': 'user', 'content': 'Пользователь остановил задачу.'})
             await reply(update, 'Задача остановлена.')
         except Exception as e:
+            RUN_STATE.update(phase='error', reason=type(e).__name__)
             # Never forward provider exceptions; they can contain credential-bearing URLs.
             from .gemini_web import GeminiWebError
             await reply(update, str(e) if isinstance(e, GeminiWebError) else
                 f'Задача не завершена ({type(e).__name__}). Проверь /setup, /checklogin и доступ к модели. Секреты не выводятся.')
         finally:
+            if RUN_STATE['phase'] in ('running', 'checking_completion'):
+                RUN_STATE.update(phase='paused', reason='ошибка протокола, заданный лимит или защита от зависания; задача не завершена')
             await persist_history()
             ACTIVE = None
 
@@ -501,6 +602,10 @@ async def post_init(application):
     global WEB_RUNNER
     from .web import start_server
     WEB_RUNNER = await start_server()
+    try:
+        await sync_commands(application.bot)
+    except Exception as e:
+        logging.warning('Command menu sync failed: %s', type(e).__name__)
 
 
 async def post_shutdown(application):
@@ -529,8 +634,9 @@ def main():
     if goal_file.exists():
         GOAL = json.loads(goal_file.read_text())
     app = Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
-    for name in ('start', 'help', 'status', 'setup', 'mode', 'models', 'new', 'stop', 'cancel', 'login', 'checklogin', 'screen', 'secret', 'continue', 'steps', 'unlimited', 'autonomy', 'model', 'strength', 'strengths'):
+    for name, _ in COMMANDS:
         app.add_handler(CommandHandler(name, command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL, incoming))
     app.add_error_handler(error_handler)

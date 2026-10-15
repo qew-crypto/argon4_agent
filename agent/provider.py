@@ -10,7 +10,7 @@ Follow the owner's host permission policy. Routine browser navigation, clicking,
 In Web or legacy JSON API mode, return ONLY one JSON object:
 {"reply":"answer/update","status":"completed|needs_input|blocked|progress","evidence":"observed result"}
 {"tool":"tool_name","args":{...}}
-Use exactly one action per step. In native API tool mode use the supplied function calls; finish_task ends work, report_progress does NOT end work. Continue working after progress messages. Do not mark promises/plans as completed. Complete a tool-based task only after checking the result from tools. If the task is unfinished, call the next tool rather than ending with instructions to the owner or asking to continue. Available tools:
+Use exactly one action per step. In native API tool mode use the supplied function calls; finish_task ends work, report_progress does NOT end work. Continue working after progress messages. Do not mark promises/plans as completed. Complete a tool-based task only after checking the result from tools. If the task is unfinished, call the next tool rather than ending with instructions to the owner or asking to continue. For a whole workflow/test, an answer to question 1 is progress: select/fill it, save it and continue through ALL requested steps. A read-only whole-goal checker will reject subtask completions; never use finish_task as a progress update. Available tools:
 shell(command: string): run a shell command in workspace.
 read_file(path: string): read text or extract PDF text.
 write_file(path: string, text: string): write UTF-8 text.
@@ -82,7 +82,7 @@ class Provider:
             self.client = None
         await self.web.close()
 
-    async def next(self, mode, messages):
+    async def next(self, mode, messages, *, require_action=False):
         messages = messages[-32:]
         timeout = int(os.getenv('MODEL_TIMEOUT', '180'))
         if mode == 'api':
@@ -95,7 +95,8 @@ class Provider:
                     base_url=self.config.data['base_url'], timeout=timeout, max_retries=1)
             request = {'model': model, 'messages': [{'role': 'system', 'content': SYSTEM}, *messages]}
             if self.native_tools:
-                request.update(tools=TOOLS, tool_choice='auto', parallel_tool_calls=False)
+                supplied = [t for t in TOOLS if t['function']['name'] not in ('finish_task', 'report_progress')] if require_action else TOOLS
+                request.update(tools=supplied, tool_choice='required' if require_action else 'auto', parallel_tool_calls=False)
             # Some OpenAI-compatible endpoints do not implement native calls.
             # Only a clear 400 unsupported-feature response falls back; never hide
             # auth/quota/model/network errors or replay external tool side effects.
@@ -115,7 +116,53 @@ class Provider:
                 raise ProtocolError('Empty provider response')
             if getattr(response.choices[0], 'finish_reason', None) == 'length':
                 raise ProtocolError('Truncated model response')
-            return from_message(response.choices[0].message)
+            action = from_message(response.choices[0].message)
+            if require_action and 'tool' not in action:
+                raise ProtocolError('A concrete tool action is required after incomplete work')
+            return action
         if mode == 'web':
-            return from_text(await self.web.generate(SYSTEM, messages))
+            extra = '\nYour previous completion/update was rejected. Return the NEXT actual tool action, not reply/finish.' if require_action else ''
+            action = from_text(await self.web.generate(SYSTEM + extra, messages))
+            if require_action and 'tool' not in action:
+                raise ProtocolError('A concrete tool action is required')
+            return action
         raise ValueError('Неизвестный режим подключения: используй api или web')
+
+    async def review_completion(self, mode, goal, candidate, trace, snapshot):
+        from .completion import REVIEW_SYSTEM
+        plain_trace, images = [], []
+        for msg in trace[-24:]:
+            content = msg['content']
+            if isinstance(content, list):
+                images.extend(x for x in content if x.get('type') == 'image_url')
+                content = '\n'.join(x['text'] for x in content if x.get('type') == 'text')
+            plain_trace.append({'role': msg['role'], 'content': content})
+        payload = json.dumps({'original_goal': goal, 'candidate_completion': candidate,
+            'recent_trace': plain_trace, 'fresh_browser_observation': snapshot}, ensure_ascii=False)
+        if mode == 'api':
+            if self.client is None:
+                raise ProtocolError('Completion checker has no initialized API client')
+            review_content = [{'type': 'text', 'text': payload}, *images[-4:]] if images else payload
+            response = await self.client.chat.completions.create(
+                model=self.config.data['api_model'],
+                messages=[{'role': 'system', 'content': REVIEW_SYSTEM}, {'role': 'user', 'content': review_content}])
+            if not response.choices or getattr(response.choices[0], 'finish_reason', None) == 'length':
+                raise ProtocolError('Invalid completion review')
+            raw = response.choices[0].message.content or ''
+        else:
+            # Gemini UI's JSON validator expects the ordinary reply/status shape.
+            system = REVIEW_SYSTEM.replace(
+                '{"approved":true|false,"reason":"brief evidence or missing work"}',
+                '{"reply":"brief evidence or missing work","status":"completed if approved, otherwise progress","evidence":"observation"}')
+            result = from_text(await self.web.generate(system, [{'role': 'user', 'content': payload}]))
+            return {'approved': result.get('status') == 'completed', 'reason': result['reply'][:2000]}
+        text = raw.strip()
+        if text.startswith('```') and '\n' in text:
+            text = text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
+        try:
+            result = json.loads(text)
+        except ValueError:
+            raise ProtocolError('Completion checker returned invalid JSON') from None
+        if not isinstance(result, dict) or type(result.get('approved')) is not bool or not isinstance(result.get('reason'), str):
+            raise ProtocolError('Invalid completion decision')
+        return {'approved': result['approved'], 'reason': result['reason'][:2000]}

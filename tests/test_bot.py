@@ -123,7 +123,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 tools = SimpleNamespace(execute=AsyncMock(return_value='saved'), close=AsyncMock())
                 bot.TOOLS = tools
                 step = {'tool': 'list_files', 'args': {'path': '.'}}
-                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=[step, step, {'reply': 'finished'}]))
+                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=[step, step, {'reply': 'finished'}]), review_completion=AsyncMock(return_value={'approved': True, 'reason': 'fixture done'}))
                 first = self.make_update(7, text='Сделай большую задачу')
                 first.effective_message.document = None; first.effective_message.photo = []
                 with patch.object(bot, 'approve', AsyncMock(return_value=True)):
@@ -158,7 +158,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 actions = [{'reply': 'Сейчас открою', 'status': 'progress'}]
                 actions += [{'tool': 'browser', 'args': {'action': 'text'}} for _ in range(45)]
                 actions += [{'reply': 'Проверено, готово', 'status': 'completed', 'evidence': 'UI confirmed'}]
-                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=actions))
+                bot.PROVIDER = SimpleNamespace(next=AsyncMock(side_effect=actions), review_completion=AsyncMock(return_value={'approved': True, 'reason': 'fixture done'}))
                 update = self.make_update(7, text='Долгая задача')
                 update.effective_message.document = None; update.effective_message.photo = []
                 with patch.object(bot, 'approve', AsyncMock(return_value=True)):
@@ -217,3 +217,74 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(bot.is_screen_request('Открой example.com и пришли скрин'))
         finally:
             bot.OWNER, bot.TOOLS, bot.SETUP = old
+
+    async def test_commands_work_during_task_and_update_pending_approval(self):
+        import asyncio
+        from pathlib import Path
+        old = (bot.OWNER, bot.CONFIG, bot.PROVIDER, dict(bot.RUN_STATE))
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.CONFIG = Config(t)
+                bot.PROVIDER = SimpleNamespace(web=SimpleNamespace(status='fixture'))
+                future = asyncio.get_running_loop().create_future()
+                bot.PENDING['fixture'] = future; bot.PENDING_TOOLS['fixture'] = 'browser'
+                async with bot.LOCK:
+                    await bot.command(self.make_update(7, text='/autonomy browser'), SimpleNamespace(args=['browser']))
+                    self.assertTrue(future.result())
+                    await bot.command(self.make_update(7, text='/unlimited'), SimpleNamespace(args=[]))
+                    self.assertEqual(bot.CONFIG.data['max_steps'], 0)
+                    status = self.make_update(7, text='/status')
+                    await bot.command(status, SimpleNamespace(args=[]))
+                    self.assertIn(bot.BUILD, str(status.effective_message.reply_text.await_args))
+                    menu = SimpleNamespace(set_my_commands=AsyncMock())
+                    await bot.command(self.make_update(7, text='/commands'), SimpleNamespace(args=[], bot=menu))
+                    menu.set_my_commands.assert_awaited_once()
+                names = {c.command for c in menu.set_my_commands.await_args.args[0]}
+                self.assertTrue({'unlimited', 'autonomy', 'screen', 'commands', 'secret'}.issubset(names))
+                unknown = self.make_update(7, text='/notacommand')
+                await bot.unknown_command(unknown, SimpleNamespace())
+                self.assertIn(bot.BUILD, str(unknown.effective_message.reply_text.await_args))
+            finally:
+                bot.PENDING.pop('fixture', None); bot.PENDING_TOOLS.pop('fixture', None)
+                bot.OWNER, bot.CONFIG, bot.PROVIDER, state = old; bot.RUN_STATE.clear(); bot.RUN_STATE.update(state)
+
+    async def test_question_one_completion_is_rejected_and_work_continues(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        old = (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+               bot.SETUP, bot.GOAL, list(bot.HISTORY), bot.ACTIVE, dict(bot.RUN_STATE))
+        with tempfile.TemporaryDirectory() as t:
+            try:
+                bot.OWNER = 7; bot.STATE = bot.ROOT = Path(t); bot.CONFIG = Config(t)
+                bot.CONFIG.data.update(max_steps=0, task_timeout=0)
+                bot.SETUP = None; bot.HISTORY.clear(); bot.GOAL = ''
+                page = MagicMock(); page.is_closed.return_value = False
+                tools = SimpleNamespace(page=page, execute=AsyncMock(return_value='state updated'),
+                    browser_action=AsyncMock(side_effect=[
+                        {'text': 'Вопрос 1: 3x - 7 = 8', 'controls': [{'text': 'Сохранить ответ', 'disabled': False}]},
+                        {'text': 'Работа отправлена на проверку', 'controls': []}]))
+                bot.TOOLS = tools
+                actions = [
+                    {'tool': 'browser', 'args': {'action': 'open', 'url': 'https://example.test'}},
+                    {'reply': 'Вопрос 1: x=5 (Б)', 'status': 'completed', 'evidence': 'solved question 1'},
+                    {'tool': 'browser', 'args': {'action': 'click', 'selector': '#answer-b'}},
+                    {'tool': 'browser', 'args': {'action': 'click', 'selector': '#save-next'}},
+                    {'reply': 'Все ответы отправлены', 'status': 'completed', 'evidence': 'final UI'}]
+                provider = SimpleNamespace(next=AsyncMock(side_effect=actions),
+                    review_completion=AsyncMock(return_value={'approved': True, 'reason': 'final submitted state'}))
+                bot.PROVIDER = provider
+                update = self.make_update(7, text='Пройди весь тест и отправь ответы')
+                update.effective_message.document = None; update.effective_message.photo = []
+                with patch.object(bot, 'approve', AsyncMock(return_value=True)):
+                    await bot.incoming(update, SimpleNamespace(bot=None))
+                self.assertEqual(tools.execute.await_count, 3)
+                self.assertEqual(provider.next.await_count, 5)
+                self.assertTrue(provider.next.await_args_list[2].kwargs['require_action'])
+                provider.review_completion.assert_awaited_once()  # obvious Q1 veto was deterministic
+                self.assertEqual(bot.RUN_STATE['phase'], 'completed')
+                self.assertEqual(bot.HISTORY[-1]['content'], 'Все ответы отправлены')
+                self.assertNotIn('Вопрос 1: x=5 (Б)', str(update.effective_message.reply_text.await_args_list))
+            finally:
+                (bot.OWNER, bot.CONFIG, bot.PROVIDER, bot.TOOLS, bot.STATE, bot.ROOT,
+                 bot.SETUP, bot.GOAL, hist, bot.ACTIVE, state) = old
+                bot.HISTORY[:] = hist; bot.RUN_STATE.clear(); bot.RUN_STATE.update(state)
